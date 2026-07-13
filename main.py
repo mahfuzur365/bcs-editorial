@@ -224,6 +224,7 @@ def collect_candidates():
 # Article extraction
 # ----------------------------------------------------------------------------
 def extract_article(url):
+    """Return (text, author). Author comes from page metadata; often empty."""
     try:
         resp = requests.get(url, headers=UA_HEADERS, timeout=30)
         resp.raise_for_status()
@@ -231,10 +232,16 @@ def extract_article(url):
             resp.text, include_comments=False, include_tables=False,
             favor_recall=True,
         )
-        return (text or "").strip()
+        author = ""
+        try:
+            meta = trafilatura.extract_metadata(resp.text)
+            author = (getattr(meta, "author", None) or "").strip()
+        except Exception:
+            pass
+        return (text or "").strip(), author
     except Exception as exc:
         log.warning("Extraction failed [%s]: %s", url, exc)
-        return ""
+        return "", ""
 
 
 def detect_language(text):
@@ -503,7 +510,7 @@ def main():
             skipped += 1
             continue
 
-        text = extract_article(item["url"])
+        text, author = extract_article(item["url"])
         if len(text) < MIN_ARTICLE_CHARS:
             log.info("Too short / paywalled, skipping: %s", item["title"][:60])
             skipped += 1
@@ -552,6 +559,7 @@ def main():
             "articleUrl": item["url"],
             "source": item["source"],
             "origin": item["origin"],  # "national" | "international" toggle
+            "author": author or None,
             "category": item["category"],
             "language": language,
             "summary": result["summary"],
