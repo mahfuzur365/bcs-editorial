@@ -8,94 +8,96 @@ Two feed types:
               redirect links with `googlenewsdecoder`. Best-effort: if decoding
               fails for an item, that item is skipped, never the whole run.
 
+`origin` ("national" | "international") drives the app's paper toggle.
 `always_include=True` marks editorial/opinion feeds whose every item is relevant
 for BCS prep; other feeds are filtered by TOPIC_KEYWORDS.
 """
 
 FEEDS = [
     # ---------------- Bangladeshi sources ----------------
-    {"name": "The Daily Star", "type": "rss", "lang": "en",
+    {"name": "The Daily Star", "type": "rss", "lang": "en", "origin": "national",
      "url": "https://www.thedailystar.net/opinion/rss.xml",
      "default_category": "Public Policy", "always_include": True},
 
-    {"name": "Prothom Alo", "type": "rss", "lang": "bn",
+    {"name": "Prothom Alo", "type": "rss", "lang": "bn", "origin": "national",
      "url": "https://www.prothomalo.com/feed",
      "default_category": "Public Policy"},
 
-    {"name": "Naya Diganta", "type": "gnews", "lang": "bn",
+    {"name": "Naya Diganta", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "dailynayadiganta.com",
      "default_category": "Public Policy"},
 
-    {"name": "Amar Desh", "type": "rss", "lang": "bn",
+    {"name": "Amar Desh", "type": "rss", "lang": "bn", "origin": "national",
      "url": "https://www.dailyamardesh.com/feed",
      "default_category": "Public Policy"},
 
-    {"name": "The Financial Express", "type": "rss", "lang": "en",
+    {"name": "The Financial Express", "type": "rss", "lang": "en", "origin": "national",
      "url": "https://today.thefinancialexpress.com.bd/feed",
      "default_category": "Economy"},
 
-    {"name": "The Business Standard", "type": "rss", "lang": "en",
+    {"name": "The Business Standard", "type": "rss", "lang": "en", "origin": "national",
      "url": "https://www.tbsnews.net/rss.xml",
      "default_category": "Economy"},
 
-    {"name": "Bonik Barta", "type": "gnews", "lang": "bn",
+    {"name": "Bonik Barta", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "bonikbarta.com",
      "default_category": "Economy"},
 
     # Samakal & Ittefaq serve their RSS fine to home IPs but 403 requests
     # coming from GitHub Actions datacenter IPs → Google News fallback.
-    {"name": "Samakal", "type": "gnews", "lang": "bn",
+    {"name": "Samakal", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "samakal.com",
      "default_category": "Public Policy"},
 
-    {"name": "Ittefaq", "type": "gnews", "lang": "bn",
+    {"name": "Ittefaq", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "ittefaq.com.bd",
      "default_category": "Public Policy"},
 
-    {"name": "Jugantor", "type": "gnews", "lang": "bn",
+    {"name": "Jugantor", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "jugantor.com",
      "default_category": "Public Policy"},
 
     # ---------------- International sources ----------------
-    {"name": "The Guardian", "type": "rss", "lang": "en",
+    {"name": "The Guardian", "type": "rss", "lang": "en", "origin": "international",
      "url": "https://www.theguardian.com/world/rss",
      "default_category": "World Politics"},
 
-    {"name": "The Guardian (Environment)", "type": "rss", "lang": "en",
+    {"name": "The Guardian (Environment)", "type": "rss", "lang": "en", "origin": "international",
      "url": "https://www.theguardian.com/environment/rss",
      "default_category": "Environment"},
 
-    {"name": "Al Jazeera", "type": "rss", "lang": "en",
+    {"name": "Al Jazeera", "type": "rss", "lang": "en", "origin": "international",
      "url": "https://www.aljazeera.com/xml/rss/all.xml",
      "default_category": "World Politics"},
 
-    {"name": "AP News", "type": "gnews", "lang": "en",
+    {"name": "AP News", "type": "gnews", "lang": "en", "origin": "international",
      "domain": "apnews.com",
      "default_category": "World Politics"},
 
-    {"name": "Reuters", "type": "gnews", "lang": "en",
+    {"name": "Reuters", "type": "gnews", "lang": "en", "origin": "international",
      "domain": "reuters.com",
      "default_category": "World Politics"},
 
-    {"name": "Project Syndicate", "type": "rss", "lang": "en",
+    {"name": "Project Syndicate", "type": "rss", "lang": "en", "origin": "international",
      "url": "https://www.project-syndicate.org/rss",
      "default_category": "World Politics", "always_include": True},
 
-    {"name": "WEF Agenda", "type": "gnews", "lang": "en",
+    {"name": "WEF Agenda", "type": "gnews", "lang": "en", "origin": "international",
      "domain": "weforum.org",
      "default_category": "Economy"},
 
-    {"name": "SciDev.Net", "type": "gnews", "lang": "en",
+    {"name": "SciDev.Net", "type": "gnews", "lang": "en", "origin": "international",
      "domain": "scidev.net",
      "default_category": "Environment"},
 
-    {"name": "Down To Earth", "type": "gnews", "lang": "en",
+    {"name": "Down To Earth", "type": "gnews", "lang": "en", "origin": "international",
      "domain": "downtoearth.org.in",
      "default_category": "Environment"},
 ]
 
 # Keyword → category matching (checked against feed-item title + summary).
-# English keywords are matched case-insensitively; Bengali as-is.
+# English keywords match on word boundaries (plural allowed); Bengali keywords
+# match prefix-wise so inflected forms still hit. See main.py:_keyword_pattern.
 TOPIC_KEYWORDS = {
     "Economy": [
         "economy", "economic", "inflation", "gdp", "remittance", "export",

@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 from urllib.parse import quote
@@ -211,6 +212,7 @@ def collect_candidates():
                 "title": title,
                 "source": feed["name"],
                 "lang": feed["lang"],
+                "origin": feed["origin"],
                 "category": category,
             })
             taken += 1
@@ -410,6 +412,59 @@ def store_pdf(local_path, doc_id):
 
 
 # ----------------------------------------------------------------------------
+# Retention: keep only the current calendar month
+# ----------------------------------------------------------------------------
+def purge_previous_months(db, col):
+    """Delete articles, archive-index entries, and PDFs from past months.
+    Runs every day; only does real work on the first run of a new month."""
+    month_start = f"{TODAY[:7]}-01"
+
+    try:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+        old_docs = list(col.where(filter=FieldFilter("date", "<", month_start)).stream())
+    except ImportError:
+        old_docs = list(col.where("date", "<", month_start).stream())
+    if old_docs:
+        batch = db.batch()
+        for i, snap in enumerate(old_docs, 1):
+            batch.delete(snap.reference)
+            if i % 400 == 0:  # Firestore batch limit is 500 ops
+                batch.commit()
+                batch = db.batch()
+        batch.commit()
+        log.info("Purged %d article(s) from previous months", len(old_docs))
+
+    # Trim the archive index (list of days the app shows in the archive UI).
+    days_ref = db.collection("editorial_meta").document("days")
+    snap = days_ref.get()
+    if snap.exists:
+        dates = (snap.to_dict() or {}).get("dates", [])
+        kept = sorted(d for d in dates if d >= month_start)
+        if kept != sorted(dates):
+            days_ref.set({"dates": kept})
+
+    # Old PDFs: Firebase Storage blobs in firebase mode; in github mode the
+    # local folders are deleted here and the workflow's commit removes them
+    # from the repo (raw.githubusercontent URLs die with them — their
+    # Firestore docs are already gone, so nothing links to them).
+    if PDF_STORAGE == "firebase" and STORAGE_BUCKET:
+        try:
+            bucket = fb_storage.bucket()
+            for blob in bucket.list_blobs(prefix="editorial_pdfs/"):
+                parts = blob.name.split("/")
+                if len(parts) >= 2 and parts[1] < month_start:
+                    blob.delete()
+        except Exception as exc:
+            log.warning("Storage purge failed: %s", exc)
+    pdf_root = os.path.dirname(PDF_DIR)
+    if os.path.isdir(pdf_root):
+        for name in os.listdir(pdf_root):
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", name) and name < month_start:
+                shutil.rmtree(os.path.join(pdf_root, name), ignore_errors=True)
+                log.info("Removed old PDF folder pdfs/%s", name)
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def main():
@@ -420,6 +475,11 @@ def main():
     db = init_firebase()
     gemini = genai.Client(api_key=GEMINI_API_KEY)
     col = db.collection("editorials")
+
+    try:
+        purge_previous_months(db, col)
+    except Exception as exc:
+        log.warning("Monthly purge failed (continuing): %s", exc)
 
     model = pick_model(gemini)
     if not model:
@@ -491,6 +551,7 @@ def main():
             "title": item["title"],
             "articleUrl": item["url"],
             "source": item["source"],
+            "origin": item["origin"],  # "national" | "international" toggle
             "category": item["category"],
             "language": language,
             "summary": result["summary"],
@@ -501,6 +562,13 @@ def main():
         })
         processed += 1
         log.info("Saved [%s] %s", item["source"], item["title"][:70])
+
+    if processed:
+        # Archive index: one small doc listing every day that has articles,
+        # so the app builds the archive UI with a single read.
+        db.collection("editorial_meta").document("days").set(
+            {"dates": firestore.ArrayUnion([TODAY])}, merge=True
+        )
 
     log.info("Done. saved=%d skipped=%d failed=%d", processed, skipped, failed)
     if processed == 0 and (failed > 0 or quota_gone):

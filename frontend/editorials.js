@@ -1,17 +1,29 @@
 /**
- * editorials.js — fetch daily editorials from Firestore and read them aloud.
+ * editorials.js — data layer for the editorial screen.
  *
- * Works in a plain web app AND inside Ionic Capacitor:
- *   - Native (Android/iOS): @capacitor-community/text-to-speech (free, on-device)
- *   - Web/PWA:              Web Speech API (speechSynthesis, free, built-in)
+ * UI model this supports:
+ *   [ National | International ]   ← toggle (origin field)
+ *     ▸ Economy                    ← sections grouped by category
+ *         · article card (title, source, summary, 🔊 TTS, 📄 PDF)
+ *     ▸ Geopolitics …
+ *   ─────────────────────────────
+ *   Archive (this month)           ← weekly folders → day → same view
+ *     ▸ Week 1  (1–7)
+ *         · 2026-07-01 …
  *
- * Install for Capacitor builds:
+ * Retention is handled by the backend: only the current calendar month
+ * exists in Firestore, so the archive never needs client-side pruning.
+ *
+ * All queries use equality filters only → NO composite indexes needed.
+ * Sorting is done client-side.
+ *
+ * TTS: @capacitor-community/text-to-speech on device, Web Speech API on web.
  *   npm install @capacitor-community/text-to-speech && npx cap sync
  */
 
 import { initializeApp } from "firebase/app";
 import {
-  getFirestore, collection, query, where, orderBy, limit, getDocs,
+  getFirestore, collection, doc, getDoc, query, where, getDocs,
 } from "firebase/firestore";
 import { Capacitor } from "@capacitor/core";
 import { TextToSpeech } from "@capacitor-community/text-to-speech";
@@ -28,26 +40,77 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app); // connects to the (default) database
 
+/** Category display order (matches the pipeline's category names exactly). */
+export const CATEGORIES = [
+  "Economy", "World Politics", "Geopolitics", "War & Peace",
+  "Environment", "Agriculture", "Public Policy", "Art, Literature & Culture",
+];
+
+/** Today's date the same way the backend defines it (Bangladesh time). */
+export function todayDhaka() {
+  return new Date(Date.now() + 6 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
 /* ------------------------------------------------------------------ */
 /* Firestore reads                                                     */
 /* ------------------------------------------------------------------ */
 
-/** Today's editorials (date is stored as "YYYY-MM-DD" in Bangladesh time). */
-export async function getTodayEditorials() {
-  const today = new Date(Date.now() + 6 * 3600 * 1000) // shift to UTC+6
-    .toISOString().slice(0, 10);
-  const q = query(collection(db, "editorials"), where("date", "==", today));
+/**
+ * Articles for one day + one toggle side, newest first.
+ * @param {"national"|"international"} origin
+ * @param {string} date  "YYYY-MM-DD"; defaults to today
+ */
+export async function getEditorials(origin, date = todayDhaka()) {
+  const q = query(
+    collection(db, "editorials"),
+    where("origin", "==", origin),
+    where("date", "==", date),
+  );
   const snap = await getDocs(q);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() }))
+    .sort((a, b) => (b.createdAt?.seconds ?? 0) - (a.createdAt?.seconds ?? 0));
 }
 
-/** Most recent N editorials, optionally filtered by category. */
-export async function getLatestEditorials(count = 20, category = null) {
-  const parts = [collection(db, "editorials")];
-  if (category) parts.push(where("category", "==", category));
-  parts.push(orderBy("createdAt", "desc"), limit(count));
-  const snap = await getDocs(query(...parts));
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+/** Group a result of getEditorials() into { category: [articles] },
+ *  ordered like CATEGORIES. Empty categories are omitted. */
+export function groupByCategory(articles) {
+  const grouped = {};
+  for (const cat of CATEGORIES) {
+    const items = articles.filter((a) => a.category === cat);
+    if (items.length) grouped[cat] = items;
+  }
+  // Anything with an unexpected category label still gets shown.
+  const known = new Set(CATEGORIES);
+  const rest = articles.filter((a) => !known.has(a.category));
+  if (rest.length) grouped["Others"] = rest;
+  return grouped;
+}
+
+/**
+ * Archive index: one document read. Returns this month's days (newest
+ * first) grouped into weekly folders:
+ *   [{ week: 1, label: "Week 1", days: ["2026-07-07", …] }, …]
+ * Excludes `today` so the archive only shows previous days.
+ */
+export async function getArchive() {
+  const snap = await getDoc(doc(db, "editorial_meta", "days"));
+  const today = todayDhaka();
+  const dates = ((snap.exists() ? snap.data().dates : []) || [])
+    .filter((d) => d < today)
+    .sort()
+    .reverse();
+
+  const weeks = new Map();
+  for (const date of dates) {
+    const dayOfMonth = Number(date.slice(8, 10));
+    const week = Math.floor((dayOfMonth - 1) / 7) + 1; // 1–7 → wk1, 8–14 → wk2 …
+    if (!weeks.has(week)) weeks.set(week, []);
+    weeks.get(week).push(date);
+  }
+  return [...weeks.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([week, days]) => ({ week, label: `Week ${week}`, days }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -112,9 +175,17 @@ function speakOnWeb(text, lang) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Example usage                                                       */
+/* Example: wiring the whole screen                                    */
 /* ------------------------------------------------------------------ */
-// const items = await getTodayEditorials();
-// renderList(items);                    // title, source, category, summary
-// speakSummary(items[0]);               // 🔊 listen to the summary
-// window.open(items[0].pdfUrl);         // 📄 open the full-article PDF
+// let origin = "national";                       // toggle state
+//
+// // Main view (today, grouped by category):
+// const grouped = groupByCategory(await getEditorials(origin));
+// // → render an accordion section per key; cards show title/source/summary,
+// //   a 🔊 button (speakSummary), 📖 vocab chips, and a PDF link (pdfUrl).
+//
+// // Archive at the bottom (previous days of this month, weekly folders):
+// const archive = await getArchive();
+// // → [{label: "Week 2", days: ["2026-07-13", "2026-07-12", …]}, …]
+// // Tapping a day re-renders the same categorized view for that date:
+// const dayView = groupByCategory(await getEditorials(origin, "2026-07-12"));

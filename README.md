@@ -82,6 +82,10 @@ service cloud.firestore {
       allow read: if true;    // or `if request.auth != null;` once you add auth
       allow write: if false;
     }
+    match /editorial_meta/{doc} {   // archive index (list of days)
+      allow read: if true;
+      allow write: if false;
+    }
   }
 }
 ```
@@ -108,6 +112,7 @@ Actions manual run.)
   "title": "…",
   "articleUrl": "https://…",
   "source": "Al Jazeera",
+  "origin": "international",
   "category": "War & Peace",
   "language": "en",
   "summary": "Comprehensive summary…",
@@ -119,6 +124,15 @@ Actions manual run.)
 ```
 
 Doc ID = SHA-1 of the article URL → automatic dedupe across days.
+
+`origin` drives the app's National/International toggle. A single
+`editorial_meta/days` document lists every day that has articles — the app's
+archive UI (weekly folders → days) is built from that one read.
+
+**Retention:** only the current calendar month is kept. On the first run of a
+new month the pipeline deletes all previous-month Firestore docs, the old
+entries in `editorial_meta/days`, and the old PDFs (repo folders in github
+mode, Storage blobs in firebase mode).
 
 ## Source notes (verified July 2026)
 
