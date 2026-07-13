@@ -10,7 +10,7 @@ everything to **Firestore (Spark plan, `(default)` database)**.
 GitHub Actions (cron 06:00 BST)
   → RSS + Google News fallback (feedparser / googlenewsdecoder)
   → full text extraction (trafilatura)
-  → Gemini 2.5 Flash: summary + vocabulary (JSON)
+  → Gemini Flash (auto-selected newest model): summary + vocabulary (JSON)
   → PDF (WeasyPrint + Noto Sans Bengali — correct conjunct/matra shaping)
   → PDF hosted in this repo (raw.githubusercontent.com)  ← default, free
   → Firestore doc: title, date, source, category, summary, vocabulary, pdfUrl
@@ -45,8 +45,13 @@ The workflow is already at `.github/workflows/main.yml`.
 ### 2. Get the two keys
 
 - **Gemini API key** — <https://aistudio.google.com/apikey> → "Create API key".
-  Free tier; the pipeline caps itself at 18 articles/day with 8-second gaps,
-  far below the free limits of `gemini-2.5-flash`.
+  Free tier; the pipeline caps itself at 15 articles/day with 8-second gaps.
+  The script asks the API which models your key can use and picks the newest
+  Flash model automatically (hardcoded names break when Google retires models —
+  `gemini-2.5-flash` already 404s for new keys). Set the `GEMINI_MODEL` env
+  var only if you want to force a specific model. If the daily quota runs out
+  mid-run, the run stops cleanly and keeps whatever was already saved; free
+  quota resets at midnight US Pacific (~1 PM Bangladesh time).
 - **Firebase service account** — Firebase console → ⚙️ Project settings →
   *Service accounts* → **Generate new private key**. This downloads a JSON
   file. Never commit it.
@@ -115,12 +120,13 @@ Doc ID = SHA-1 of the article URL → automatic dedupe across days.
 
 ## Source notes (verified July 2026)
 
-Direct RSS (working): Daily Star (opinion), Prothom Alo, Amar Desh, Financial
-Express (`today.` subdomain), TBS, Samakal (`/rss`), Ittefaq (`/feed/`),
-Guardian (world + environment), Al Jazeera, Project Syndicate.
+Direct RSS (working from GitHub runners): Daily Star (opinion), Prothom Alo,
+Amar Desh, Financial Express (`today.` subdomain), TBS, Guardian (world +
+environment), Al Jazeera, Project Syndicate.
 
-Via **Google News fallback** (site blocks bots or has no RSS): Jugantor,
-Naya Diganta, Bonik Barta, **AP News**, **Reuters** (both discontinued public
+Via **Google News fallback** (site blocks bots/datacenter IPs or has no RSS):
+Jugantor, Naya Diganta, Bonik Barta, Samakal, Ittefaq (their RSS 403s requests
+from GitHub's IP ranges), **AP News**, **Reuters** (both discontinued public
 RSS), WEF Agenda, SciDev.Net, Down To Earth. These use Google News RSS scoped
 to the domain + `googlenewsdecoder`; if Google changes its link format some
 items may be skipped for a while — the run never fails because of it. Feed
@@ -130,8 +136,8 @@ URLs live in [sources.py](sources.py); edit that file to add/remove sources.
 
 | Service | Usage | Free limit |
 |---|---|---|
-| Gemini 2.5 Flash | ≤ 18 requests | 250 requests/day, 10/min |
-| Firestore writes | ≤ 18 | 20,000/day |
+| Gemini Flash (auto-picked) | ≤ 15 requests | varies by model; script stops cleanly at the daily cap |
+| Firestore writes | ≤ 15 | 20,000/day |
 | Firestore reads (dedupe) | ~60 | 50,000/day |
 | GitHub Actions | ~8 min | unlimited (public repo) |
 | PDF hosting | ~2 MB/day in-repo | 1 GB soft repo limit ≈ years of PDFs |

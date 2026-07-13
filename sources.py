@@ -42,12 +42,14 @@ FEEDS = [
      "domain": "bonikbarta.com",
      "default_category": "Economy"},
 
-    {"name": "Samakal", "type": "rss", "lang": "bn",
-     "url": "https://samakal.com/rss",
+    # Samakal & Ittefaq serve their RSS fine to home IPs but 403 requests
+    # coming from GitHub Actions datacenter IPs → Google News fallback.
+    {"name": "Samakal", "type": "gnews", "lang": "bn",
+     "domain": "samakal.com",
      "default_category": "Public Policy"},
 
-    {"name": "Ittefaq", "type": "rss", "lang": "bn",
-     "url": "https://www.ittefaq.com.bd/feed/",
+    {"name": "Ittefaq", "type": "gnews", "lang": "bn",
+     "domain": "ittefaq.com.bd",
      "default_category": "Public Policy"},
 
     {"name": "Jugantor", "type": "gnews", "lang": "bn",

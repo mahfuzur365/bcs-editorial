@@ -19,9 +19,11 @@ Environment variables (see README.md):
   PDF_STORAGE                  "github" (default) | "firebase"
   FIREBASE_STORAGE_BUCKET      required only when PDF_STORAGE=firebase
   GITHUB_REPOSITORY / GITHUB_REF_NAME   set automatically by Actions
-  GEMINI_MODEL                 default "gemini-2.5-flash"
+  GEMINI_MODEL                 optional override; by default the script asks the
+                               API which models this key can use and picks the
+                               newest Flash model (survives model retirements)
   MAX_PER_SOURCE               default 2
-  MAX_TOTAL                    default 18   (keeps Gemini free tier safe)
+  MAX_TOTAL                    default 15   (keeps Gemini free tier safe)
 """
 
 import datetime as dt
@@ -54,11 +56,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("editorial")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # optional override
 PDF_STORAGE = os.environ.get("PDF_STORAGE", "github").lower()
 STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
 MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
-MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "18"))
+MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "15"))
 RECENCY_HOURS = 36
 MIN_ARTICLE_CHARS = 600
 GEMINI_COOLDOWN_SECONDS = 8  # free tier ≈ 10 requests/min → stay under it
@@ -227,14 +229,68 @@ def detect_language(text):
 # ----------------------------------------------------------------------------
 # Gemini summarization
 # ----------------------------------------------------------------------------
-def summarize(client, title, source, text):
-    """Return {"summary": str, "vocabulary": list} or None on failure."""
+class ModelUnavailable(Exception):
+    """The model returned 404 — retired/unavailable for this API key."""
+
+
+class DailyQuotaExhausted(Exception):
+    """Free-tier requests-per-day quota is gone; it won't reset mid-run."""
+
+
+def list_usable_models(client):
+    """Model names this API key can call generateContent on."""
+    names = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").removeprefix("models/")
+            actions = getattr(m, "supported_actions", None) or []
+            if name and (not actions or "generateContent" in actions):
+                names.append(name)
+    except Exception as exc:
+        log.warning("Could not list Gemini models: %s", exc)
+    return names
+
+
+def pick_model(client, exclude=()):
+    """Pick the best available Flash model. Hardcoding a model name broke once
+    already (gemini-2.5-flash was retired for new keys), so ask the API."""
+    preferred = [p for p in (
+        GEMINI_MODEL,               # explicit override wins if usable
+        "gemini-flash-latest",      # rolling alias maintained by Google
+        "gemini-flash-lite-latest",
+    ) if p and p not in exclude]
+
+    available = [n for n in list_usable_models(client) if n not in exclude]
+    for p in preferred:
+        if p in available:
+            return p
+
+    flashes = [
+        n for n in available
+        if n.startswith("gemini") and "flash" in n
+        and not any(x in n for x in ("image", "tts", "live", "audio", "embed"))
+    ]
+    if flashes:
+        def rank(n):
+            m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+            version = float(m.group(1)) if m else 0.0
+            return (version, "lite" not in n, "preview" not in n)
+        return max(flashes, key=rank)
+
+    # Listing failed entirely → fall back to trying the rolling aliases blind.
+    return preferred[0] if preferred else None
+
+
+def summarize(client, model, title, source, text):
+    """Return {"summary", "vocabulary"} or None (bad output after retries).
+    Raises ModelUnavailable / DailyQuotaExhausted — the caller must react,
+    retrying those here would only burn the daily quota for nothing."""
     prompt = SUMMARY_PROMPT.replace("{source}", source).replace("{title}", title) \
                            .replace("{text}", text[:30000])
     for attempt in range(1, 4):
         try:
             resp = client.models.generate_content(
-                model=GEMINI_MODEL,
+                model=model,
                 contents=prompt,
                 config={"response_mime_type": "application/json", "temperature": 0.4},
             )
@@ -252,9 +308,17 @@ def summarize(client, title, source, text):
             ]
             return {"summary": data["summary"].strip(), "vocabulary": vocab}
         except Exception as exc:
-            wait = 30 if ("429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)) else 8
-            log.warning("Gemini attempt %d failed (%s); retrying in %ds", attempt, exc, wait)
-            time.sleep(wait)
+            msg = str(exc)
+            if "NOT_FOUND" in msg or "404" in msg:
+                raise ModelUnavailable(model) from exc
+            if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                if "PerDay" in msg or "per day" in msg.lower():
+                    raise DailyQuotaExhausted(model) from exc
+                log.warning("Gemini rate-limited (attempt %d); waiting 40s", attempt)
+                time.sleep(40)
+                continue
+            log.warning("Gemini attempt %d failed (%s); retrying in 8s", attempt, exc)
+            time.sleep(8)
     return None
 
 
@@ -339,10 +403,18 @@ def main():
     gemini = genai.Client(api_key=GEMINI_API_KEY)
     col = db.collection("editorials")
 
+    model = pick_model(gemini)
+    if not model:
+        log.error("No usable Gemini model found for this API key.")
+        sys.exit(1)
+    log.info("Using Gemini model: %s", model)
+    dead_models = set()
+
     candidates = collect_candidates()
     log.info("Collected %d candidate article(s)", len(candidates))
 
     processed = failed = skipped = 0
+    quota_gone = False
     for item in candidates:
         if processed >= MAX_TOTAL:
             log.info("Reached MAX_TOTAL=%d; stopping.", MAX_TOTAL)
@@ -360,7 +432,30 @@ def main():
             continue
 
         language = detect_language(text)
-        result = summarize(gemini, item["title"], item["source"], text)
+        result = None
+        while True:
+            try:
+                result = summarize(gemini, model, item["title"], item["source"], text)
+                break
+            except ModelUnavailable:
+                dead_models.add(model)
+                log.warning("Model %s unavailable for this key; picking another", model)
+                model = pick_model(gemini, exclude=dead_models)
+                if not model:
+                    log.error("Ran out of usable Gemini models; stopping run.")
+                    quota_gone = True
+                    break
+                log.info("Switched to Gemini model: %s", model)
+            except DailyQuotaExhausted:
+                log.warning(
+                    "Gemini free-tier daily quota exhausted; stopping for today. "
+                    "Already-saved articles are kept; quota resets at midnight "
+                    "US Pacific time (~1 PM Bangladesh time)."
+                )
+                quota_gone = True
+                break
+        if quota_gone:
+            break
         time.sleep(GEMINI_COOLDOWN_SECONDS)
         if not result:
             failed += 1
@@ -390,8 +485,8 @@ def main():
         log.info("Saved [%s] %s", item["source"], item["title"][:70])
 
     log.info("Done. saved=%d skipped=%d failed=%d", processed, skipped, failed)
-    if processed == 0 and failed > 0:
-        sys.exit(1)  # everything that was attempted failed → surface in Actions
+    if processed == 0 and (failed > 0 or quota_gone):
+        sys.exit(1)  # nothing was saved despite trying → surface red in Actions
 
 
 if __name__ == "__main__":
