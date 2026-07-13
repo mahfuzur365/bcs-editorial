@@ -1,0 +1,59 @@
+# Daily editorial pipeline — runs at 06:00 Bangladesh time (00:00 UTC).
+# Free tier: GitHub Actions public repos have unlimited minutes;
+# this run takes ~5-8 minutes.
+name: daily-editorials
+
+on:
+  schedule:
+    - cron: "0 0 * * *"        # 00:00 UTC == 06:00 AM BST (UTC+6)
+  workflow_dispatch: {}         # manual "Run workflow" button for testing
+
+concurrency:
+  group: daily-editorials
+  cancel-in-progress: false
+
+permissions:
+  contents: write               # needed to commit the generated PDFs
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # WeasyPrint needs Pango for rendering; Noto fonts give correct
+      # Bengali shaping (conjuncts, vowel signs) in the PDFs.
+      - name: Install system libraries and Bengali fonts
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
+            fonts-noto-core fonts-noto-ui-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          FIREBASE_STORAGE_BUCKET: ${{ secrets.FIREBASE_STORAGE_BUCKET }}
+          PDF_STORAGE: ${{ vars.PDF_STORAGE }}   # empty → script defaults to "github"
+        run: python main.py
+
+      # In the default "github" storage mode the PDFs live in this repo and
+      # are served free from raw.githubusercontent.com (repo must be public).
+      - name: Commit generated PDFs
+        run: |
+          git config user.name "editorial-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add pdfs || true
+          git diff --cached --quiet || git commit -m "PDFs for $(date -u +%F)"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push

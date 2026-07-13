@@ -1,0 +1,398 @@
+"""
+Daily Editorial Pipeline — BCS Mentor
+=====================================
+Runs on GitHub Actions (free tier) every day at 06:00 Bangladesh time.
+
+Flow:
+  1. Pull latest items from configured RSS feeds / Google News fallbacks.
+  2. Filter to the 6 BCS-relevant topics, dedupe against Firestore.
+  3. Extract full article text (trafilatura).
+  4. Summarize + extract vocabulary with Gemini API (free tier, rate-limited).
+  5. Render a UTF-8 / Bengali-correct PDF (WeasyPrint → Pango/HarfBuzz shaping).
+  6. Store the PDF (GitHub repo by default, Firebase Storage optional).
+  7. Write the document to Firestore `(default)` database, `editorials` collection.
+
+Environment variables (see README.md):
+  GEMINI_API_KEY               required
+  FIREBASE_SERVICE_ACCOUNT     required (raw JSON of the service-account key)
+  FIREBASE_SERVICE_ACCOUNT_FILE  alternative: path to the key file (local dev)
+  PDF_STORAGE                  "github" (default) | "firebase"
+  FIREBASE_STORAGE_BUCKET      required only when PDF_STORAGE=firebase
+  GITHUB_REPOSITORY / GITHUB_REF_NAME   set automatically by Actions
+  GEMINI_MODEL                 default "gemini-2.5-flash"
+  MAX_PER_SOURCE               default 2
+  MAX_TOTAL                    default 18   (keeps Gemini free tier safe)
+"""
+
+import datetime as dt
+import hashlib
+import html
+import json
+import logging
+import os
+import re
+import sys
+import time
+from urllib.parse import quote
+from uuid import uuid4
+
+import feedparser
+import requests
+import trafilatura
+
+import firebase_admin
+from firebase_admin import credentials, firestore, storage as fb_storage
+
+from google import genai
+
+from sources import FEEDS, TOPIC_KEYWORDS
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("editorial")
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+PDF_STORAGE = os.environ.get("PDF_STORAGE", "github").lower()
+STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
+MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
+MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "18"))
+RECENCY_HOURS = 36
+MIN_ARTICLE_CHARS = 600
+GEMINI_COOLDOWN_SECONDS = 8  # free tier ≈ 10 requests/min → stay under it
+
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
+}
+
+TODAY = dt.datetime.now(dt.timezone.utc).astimezone(
+    dt.timezone(dt.timedelta(hours=6))  # Bangladesh Standard Time
+).date().isoformat()
+
+PDF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdfs", TODAY)
+
+SUMMARY_PROMPT = (
+    "Write a comprehensive summary of this article that captures the main theme "
+    "and all vital points accurately. Do not make it too short; ensure no "
+    "important information is missed. IF the original article is in English, "
+    "ALSO extract 5-7 crucial advanced vocabulary words and provide their "
+    "precise Bengali meanings.\n\n"
+    "Respond ONLY with valid JSON in exactly this shape:\n"
+    '{"summary": "<the comprehensive summary>", '
+    '"vocabulary": [{"word": "<english word>", "meaning_bn": "<precise Bengali meaning>"}]}\n'
+    "If the article is NOT in English, return an empty list for \"vocabulary\".\n\n"
+    "ARTICLE (source: {source}, title: {title}):\n{text}"
+)
+
+
+# ----------------------------------------------------------------------------
+# Firebase
+# ----------------------------------------------------------------------------
+def init_firebase():
+    key_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
+    key_file = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", "")
+    if key_json:
+        cred = credentials.Certificate(json.loads(key_json))
+    elif key_file:
+        cred = credentials.Certificate(key_file)
+    else:
+        log.error("No Firebase credentials. Set FIREBASE_SERVICE_ACCOUNT secret.")
+        sys.exit(1)
+    opts = {"storageBucket": STORAGE_BUCKET} if STORAGE_BUCKET else {}
+    firebase_admin.initialize_app(cred, opts)
+    return firestore.client()  # uses the (default) database ID
+
+
+# ----------------------------------------------------------------------------
+# Feed collection
+# ----------------------------------------------------------------------------
+def fetch_feed(url):
+    """Fetch a feed with a browser UA (many BD sites block default clients)."""
+    resp = requests.get(url, headers=UA_HEADERS, timeout=25)
+    resp.raise_for_status()
+    return feedparser.parse(resp.content)
+
+
+def gnews_url(domain, lang):
+    hl, gl, ceid = ("bn", "BD", "BD:bn") if lang == "bn" else ("en-US", "US", "US:en")
+    q = quote(f"site:{domain} when:1d")
+    return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+
+
+def resolve_gnews_link(link):
+    """Google News RSS links are redirects; decode to the real article URL."""
+    try:
+        from googlenewsdecoder import gnewsdecoder
+        result = gnewsdecoder(link, interval=1)
+        if result.get("status"):
+            return result["decoded_url"]
+    except Exception as exc:
+        log.warning("Google News link decode failed: %s", exc)
+    return None
+
+
+def is_recent(entry):
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return True  # many opinion feeds omit dates; accept and rely on dedupe
+    published = dt.datetime(*parsed[:6], tzinfo=dt.timezone.utc)
+    age = dt.datetime.now(dt.timezone.utc) - published
+    return age <= dt.timedelta(hours=RECENCY_HOURS)
+
+
+def match_category(text):
+    """Return (category, score) for the best keyword match, or (None, 0)."""
+    lowered = text.lower()
+    best, best_score = None, 0
+    for category, keywords in TOPIC_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in lowered)
+        if score > best_score:
+            best, best_score = category, score
+    return best, best_score
+
+
+def collect_candidates():
+    """Yield dicts: {url, title, source, lang, category} across all feeds."""
+    candidates = []
+    for feed in FEEDS:
+        url = feed["url"] if feed["type"] == "rss" else gnews_url(feed["domain"], feed["lang"])
+        try:
+            parsed = fetch_feed(url)
+        except Exception as exc:
+            log.warning("Feed failed [%s]: %s", feed["name"], exc)
+            continue
+        taken = 0
+        for entry in parsed.entries:
+            if taken >= MAX_PER_SOURCE:
+                break
+            if not is_recent(entry):
+                continue
+            title = html.unescape(entry.get("title", "")).strip()
+            snippet = re.sub(r"<[^>]+>", " ", entry.get("summary", ""))
+            category, score = match_category(f"{title} {snippet}")
+            if not category:
+                if feed.get("always_include"):
+                    category = feed["default_category"]
+                else:
+                    continue
+            link = entry.get("link", "")
+            if not link or not title:
+                continue
+            if feed["type"] == "gnews":
+                link = resolve_gnews_link(link)
+                if not link:
+                    continue
+            candidates.append({
+                "url": link,
+                "title": title,
+                "source": feed["name"],
+                "lang": feed["lang"],
+                "category": category,
+            })
+            taken += 1
+        log.info("Feed [%s]: kept %d item(s)", feed["name"], taken)
+    return candidates
+
+
+# ----------------------------------------------------------------------------
+# Article extraction
+# ----------------------------------------------------------------------------
+def extract_article(url):
+    try:
+        resp = requests.get(url, headers=UA_HEADERS, timeout=30)
+        resp.raise_for_status()
+        text = trafilatura.extract(
+            resp.text, include_comments=False, include_tables=False,
+            favor_recall=True,
+        )
+        return (text or "").strip()
+    except Exception as exc:
+        log.warning("Extraction failed [%s]: %s", url, exc)
+        return ""
+
+
+def detect_language(text):
+    """'bn' if a meaningful share of characters are in the Bengali block."""
+    if not text:
+        return "en"
+    bengali = sum(1 for ch in text if "ঀ" <= ch <= "৿")
+    letters = sum(1 for ch in text if ch.isalpha())
+    return "bn" if letters and bengali / letters > 0.3 else "en"
+
+
+# ----------------------------------------------------------------------------
+# Gemini summarization
+# ----------------------------------------------------------------------------
+def summarize(client, title, source, text):
+    """Return {"summary": str, "vocabulary": list} or None on failure."""
+    prompt = SUMMARY_PROMPT.replace("{source}", source).replace("{title}", title) \
+                           .replace("{text}", text[:30000])
+    for attempt in range(1, 4):
+        try:
+            resp = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={"response_mime_type": "application/json", "temperature": 0.4},
+            )
+            raw = (resp.text or "").strip()
+            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
+            data = json.loads(raw)
+            if not isinstance(data.get("summary"), str) or not data["summary"]:
+                raise ValueError("missing summary field")
+            vocab = data.get("vocabulary") or []
+            vocab = [
+                {"word": str(v.get("word", "")).strip(),
+                 "meaning_bn": str(v.get("meaning_bn", "")).strip()}
+                for v in vocab
+                if isinstance(v, dict) and v.get("word") and v.get("meaning_bn")
+            ]
+            return {"summary": data["summary"].strip(), "vocabulary": vocab}
+        except Exception as exc:
+            wait = 30 if ("429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)) else 8
+            log.warning("Gemini attempt %d failed (%s); retrying in %ds", attempt, exc, wait)
+            time.sleep(wait)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# PDF generation (WeasyPrint — proper complex-script shaping for Bengali)
+# ----------------------------------------------------------------------------
+PDF_TEMPLATE = """
+<meta charset="utf-8">
+<style>
+  @page {{ size: A4; margin: 2cm 1.8cm; }}
+  body {{
+    font-family: "Noto Sans Bengali", "Noto Serif", "Noto Sans", sans-serif;
+    font-size: 11.5pt; line-height: 1.65; color: #1a1a1a;
+  }}
+  .meta {{ color: #555; font-size: 9.5pt; margin-bottom: 4px; }}
+  h1 {{ font-size: 17pt; line-height: 1.35; margin: 2px 0 10px; }}
+  hr {{ border: none; border-top: 1px solid #ccc; margin: 10px 0 16px; }}
+  p {{ margin: 0 0 10px; text-align: justify; }}
+  .footer {{ color: #888; font-size: 8.5pt; margin-top: 24px; }}
+</style>
+<div class="meta">{source} &nbsp;•&nbsp; {date} &nbsp;•&nbsp; {category}</div>
+<h1>{title}</h1>
+<hr>
+{paragraphs}
+<div class="footer">Original: {url}<br>Generated by BCS Mentor daily editorial pipeline.</div>
+"""
+
+
+def build_pdf(item, text, out_path):
+    from weasyprint import HTML  # imported lazily: needs system Pango libs
+    paragraphs = "".join(
+        f"<p>{html.escape(p.strip())}</p>"
+        for p in text.split("\n") if p.strip()
+    )
+    doc_html = PDF_TEMPLATE.format(
+        source=html.escape(item["source"]),
+        date=TODAY,
+        category=html.escape(item["category"]),
+        title=html.escape(item["title"]),
+        paragraphs=paragraphs,
+        url=html.escape(item["url"]),
+    )
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    HTML(string=doc_html).write_pdf(out_path)
+
+
+# ----------------------------------------------------------------------------
+# PDF storage
+# ----------------------------------------------------------------------------
+def store_pdf(local_path, doc_id):
+    """Return a public download URL, or None."""
+    if PDF_STORAGE == "firebase" and STORAGE_BUCKET:
+        try:
+            bucket = fb_storage.bucket()
+            blob = bucket.blob(f"editorial_pdfs/{TODAY}/{doc_id}.pdf")
+            token = uuid4().hex
+            blob.metadata = {"firebaseStorageDownloadTokens": token}
+            blob.upload_from_filename(local_path, content_type="application/pdf")
+            return (
+                f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/"
+                f"{quote(blob.name, safe='')}?alt=media&token={token}"
+            )
+        except Exception as exc:
+            log.warning("Firebase Storage upload failed (%s); keeping GitHub copy", exc)
+    # GitHub mode: the workflow commits pdfs/ back to the repo after this script.
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    branch = os.environ.get("GITHUB_REF_NAME", "main")
+    if repo:
+        return f"https://raw.githubusercontent.com/{repo}/{branch}/pdfs/{TODAY}/{doc_id}.pdf"
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    if not GEMINI_API_KEY:
+        log.error("GEMINI_API_KEY is not set.")
+        sys.exit(1)
+
+    db = init_firebase()
+    gemini = genai.Client(api_key=GEMINI_API_KEY)
+    col = db.collection("editorials")
+
+    candidates = collect_candidates()
+    log.info("Collected %d candidate article(s)", len(candidates))
+
+    processed = failed = skipped = 0
+    for item in candidates:
+        if processed >= MAX_TOTAL:
+            log.info("Reached MAX_TOTAL=%d; stopping.", MAX_TOTAL)
+            break
+
+        doc_id = hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:20]
+        if col.document(doc_id).get().exists:
+            skipped += 1
+            continue
+
+        text = extract_article(item["url"])
+        if len(text) < MIN_ARTICLE_CHARS:
+            log.info("Too short / paywalled, skipping: %s", item["title"][:60])
+            skipped += 1
+            continue
+
+        language = detect_language(text)
+        result = summarize(gemini, item["title"], item["source"], text)
+        time.sleep(GEMINI_COOLDOWN_SECONDS)
+        if not result:
+            failed += 1
+            continue
+
+        pdf_url = None
+        try:
+            local_pdf = os.path.join(PDF_DIR, f"{doc_id}.pdf")
+            build_pdf(item, text, local_pdf)
+            pdf_url = store_pdf(local_pdf, doc_id)
+        except Exception as exc:
+            log.warning("PDF step failed for %s: %s", item["title"][:60], exc)
+
+        col.document(doc_id).set({
+            "title": item["title"],
+            "articleUrl": item["url"],
+            "source": item["source"],
+            "category": item["category"],
+            "language": language,
+            "summary": result["summary"],
+            "vocabulary": result["vocabulary"],
+            "pdfUrl": pdf_url,
+            "date": TODAY,
+            "createdAt": firestore.SERVER_TIMESTAMP,
+        })
+        processed += 1
+        log.info("Saved [%s] %s", item["source"], item["title"][:70])
+
+    log.info("Done. saved=%d skipped=%d failed=%d", processed, skipped, failed)
+    if processed == 0 and failed > 0:
+        sys.exit(1)  # everything that was attempted failed → surface in Actions
+
+
+if __name__ == "__main__":
+    main()
