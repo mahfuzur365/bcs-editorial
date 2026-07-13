@@ -5,7 +5,7 @@ Runs on GitHub Actions (free tier) every day at 06:00 Bangladesh time.
 
 Flow:
   1. Pull latest items from configured RSS feeds / Google News fallbacks.
-  2. Filter to the 6 BCS-relevant topics, dedupe against Firestore.
+  2. Filter to the BCS-relevant topics in sources.py, dedupe against Firestore.
   3. Extract full article text (trafilatura).
   4. Summarize + extract vocabulary with Gemini API (free tier, rate-limited).
   5. Render a UTF-8 / Bengali-correct PDF (WeasyPrint → Pango/HarfBuzz shaping).
@@ -146,12 +146,30 @@ def is_recent(entry):
     return age <= dt.timedelta(hours=RECENCY_HOURS)
 
 
+def _keyword_pattern(kw):
+    """Word-boundary regex for a keyword. Plain substring matching misfired
+    badly ("art" in "part", "culture" in "agriculture", "war" in "warning").
+    English keywords get both boundaries plus an optional plural; Bengali
+    keywords get a leading boundary only, so inflected forms still match
+    (সংস্কৃতির, ভূ-রাজনীতিতে)."""
+    esc = re.escape(kw.lower())
+    if kw.isascii():
+        return re.compile(r"\b" + esc + r"(?:e?s)?\b")
+    return re.compile(r"\b" + esc)
+
+
+_CATEGORY_PATTERNS = {
+    category: [_keyword_pattern(kw) for kw in keywords]
+    for category, keywords in TOPIC_KEYWORDS.items()
+}
+
+
 def match_category(text):
     """Return (category, score) for the best keyword match, or (None, 0)."""
     lowered = text.lower()
     best, best_score = None, 0
-    for category, keywords in TOPIC_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in lowered)
+    for category, patterns in _CATEGORY_PATTERNS.items():
+        score = sum(1 for p in patterns if p.search(lowered))
         if score > best_score:
             best, best_score = category, score
     return best, best_score

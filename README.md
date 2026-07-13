@@ -2,7 +2,9 @@
 
 Automated pipeline: every day at **6:00 AM Bangladesh time**, GitHub Actions
 fetches editorials/news from 19 Bangladeshi + international feeds, filters them
-to 6 BCS topics, summarizes with **Gemini (free tier)**, extracts English
+to 8 BCS topics (Economy, World Politics, Geopolitics, War & Peace, Environment,
+Agriculture, Public Policy, Art/Literature/Culture), summarizes with
+**Gemini (free tier)**, extracts English
 vocabulary with Bengali meanings, renders a **Bengali-correct PDF**, and writes
 everything to **Firestore (Spark plan, `(default)` database)**.
 

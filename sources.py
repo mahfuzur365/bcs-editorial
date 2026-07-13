@@ -105,11 +105,19 @@ TOPIC_KEYWORDS = {
         "বাজেট", "ব্যাংক", "বিনিয়োগ", "রিজার্ভ", "শেয়ারবাজার", "কর",
     ],
     "World Politics": [
-        "election", "diplomacy", "diplomatic", "geopolit", "united nations",
+        "election", "diplomacy", "diplomatic", "united nations",
         "summit", "sanction", "foreign policy", "bilateral", "parliament",
         "president", "prime minister", "government", "democracy",
         "নির্বাচন", "কূটনীতি", "জাতিসংঘ", "নিষেধাজ্ঞা", "পররাষ্ট্র",
         "সংসদ", "রাষ্ট্রপতি", "প্রধানমন্ত্রী", "গণতন্ত্র", "রাজনীতি",
+    ],
+    "Geopolitics": [
+        "geopolitics", "geopolitical", "geostrategic", "geoeconomic",
+        "indo-pacific", "great power", "superpower", "regional power",
+        "sphere of influence", "balance of power", "strategic rivalry",
+        "proxy war", "hegemony",
+        "ভূ-রাজনীতি", "ভূরাজনীতি", "ভূ-রাজনৈতিক", "ভূরাজনৈতিক",
+        "পরাশক্তি", "আধিপত্য",
     ],
     "War & Peace": [
         "war", "conflict", "ceasefire", "military", "missile", "invasion",
@@ -137,5 +145,14 @@ TOPIC_KEYWORDS = {
         "judiciary", "civil service", "public administration", "subsidy",
         "নীতি", "সংস্কার", "শিক্ষা", "স্বাস্থ্য", "দুর্নীতি", "সুশাসন",
         "অবকাঠামো", "সংবিধান", "বিচার বিভাগ", "জনপ্রশাসন", "ভর্তুকি",
+    ],
+    "Art, Literature & Culture": [
+        "art", "arts", "artist", "artwork", "painting", "sculpture",
+        "literature", "literary", "novelist", "poet", "poetry", "fiction",
+        "culture", "cultural", "heritage", "museum", "theatre", "theater",
+        "folklore", "exhibition", "archaeology", "manuscript",
+        "শিল্প-সাহিত্য", "শিল্পকলা", "সাহিত্য", "সংস্কৃতি", "সাংস্কৃতিক",
+        "কবিতা", "কবি", "উপন্যাস", "ঐতিহ্য", "জাদুঘর", "চিত্রকলা",
+        "নাটক", "প্রত্নতত্ত্ব",
     ],
 }
