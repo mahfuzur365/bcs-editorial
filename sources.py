@@ -36,15 +36,15 @@ FEEDS = [
      "url": "https://www.thedailystar.net/opinion/rss.xml",  # opinion section
      "default_category": "Public Policy", "always_include": True},
 
-    # Prothom Alo has no opinion-section RSS (/opinion/feed 404s) → Google News
-    # scoped to the domain with Bengali opinion keywords.
+    # No opinion RSS → Google News scoped to the opinion-section URL PATH
+    # (verified: path-scoped site: queries work and return plenty of items).
     {"name": "Prothom Alo", "type": "gnews", "lang": "bn", "origin": "national",
-     "domain": "prothomalo.com",
-     "default_category": "Public Policy"},
+     "domain": "prothomalo.com/opinion", "terms": "",
+     "default_category": "Public Policy", "always_include": True},
 
     {"name": "Naya Diganta", "type": "gnews", "lang": "bn", "origin": "national",
-     "domain": "dailynayadiganta.com",
-     "default_category": "Public Policy"},
+     "domain": "dailynayadiganta.com/opinions", "terms": "",
+     "default_category": "Public Policy", "always_include": True},
 
     # No opinion RSS (/opinion/feed 404s) → gnews with opinion keywords.
     {"name": "Amar Desh", "type": "gnews", "lang": "bn", "origin": "national",
@@ -66,15 +66,34 @@ FEEDS = [
      "url": "https://www.tbsnews.net/thoughts/rss.xml",  # op-ed section
      "default_category": "Public Policy", "always_include": True},
 
+    {"name": "TBS Bangla (মতামত)", "type": "rss", "lang": "bn", "origin": "national",
+     "url": "https://www.tbsnews.net/bangla/opinion/rss.xml",
+     "default_category": "Public Policy", "always_include": True},
+
+    # Bonik Barta spreads opinion over three sections → custom multi-path query.
     {"name": "Bonik Barta", "type": "gnews", "lang": "bn", "origin": "national",
-     "domain": "bonikbarta.com",
-     "default_category": "Economy"},
+     "query": "site:bonikbarta.com/editorial OR site:bonikbarta.com/categories/opinion "
+              "OR site:bonikbarta.com/categories/article",
+     "default_category": "Economy", "always_include": True},
+
+    # New Age: no RSS anywhere and Google News does not index newagebd.net →
+    # scrape article links straight off the section pages.
+    {"name": "New Age (Editorial)", "type": "html", "lang": "en", "origin": "national",
+     "page": "https://www.newagebd.net/articlelist/25/editorial",
+     "link_pattern": r"https://www\.newagebd\.net/post/editorial/[^\"'\s<>]+",
+     "default_category": "Public Policy", "always_include": True},
+
+    {"name": "New Age (Opinion)", "type": "html", "lang": "en", "origin": "national",
+     "page": "https://www.newagebd.net/articlelist/54/Opinion",
+     "link_pattern": r"https://www\.newagebd\.net/post/opinion/[^\"'\s<>]+",
+     "default_category": "Public Policy", "always_include": True},
 
     # Samakal & Ittefaq serve their RSS fine to home IPs but 403 requests
-    # coming from GitHub Actions datacenter IPs → Google News fallback.
+    # coming from GitHub Actions datacenter IPs → Google News fallback,
+    # path-scoped to Samakal's opinion section.
     {"name": "Samakal", "type": "gnews", "lang": "bn", "origin": "national",
-     "domain": "samakal.com",
-     "default_category": "Public Policy"},
+     "domain": "samakal.com/opinion", "terms": "",
+     "default_category": "Public Policy", "always_include": True},
 
     {"name": "Ittefaq", "type": "gnews", "lang": "bn", "origin": "national",
      "domain": "ittefaq.com.bd",

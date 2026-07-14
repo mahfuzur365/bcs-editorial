@@ -138,14 +138,34 @@ def fetch_feed(url):
     return feedparser.parse(resp.content)
 
 
-def gnews_url(domain, lang, terms=None):
-    """Google News RSS query for a domain. `terms` narrows to opinion pieces;
-    None → language default from GNEWS_OPINION_TERMS, "" → no narrowing."""
+def gnews_url(feed):
+    """Google News RSS query for a feed. `domain` may include a URL path
+    (site:samakal.com/opinion — verified working); `query` overrides the
+    site: part entirely (multi-section sources); `terms` narrows to opinion
+    pieces (None → language default, "" → no narrowing)."""
+    lang = feed["lang"]
     hl, gl, ceid = ("bn", "BD", "BD:bn") if lang == "bn" else ("en-US", "US", "US:en")
-    if terms is None:
-        terms = GNEWS_OPINION_TERMS[lang]
-    q = quote(f"site:{domain} when:1d {terms}".strip())
-    return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
+    if feed.get("query"):
+        q = f'{feed["query"]} when:1d'
+    else:
+        terms = feed.get("terms")
+        if terms is None:
+            terms = GNEWS_OPINION_TERMS[lang]
+        q = f'site:{feed["domain"]} when:1d {terms}'.strip()
+    return f"https://news.google.com/rss/search?q={quote(q)}&hl={hl}&gl={gl}&ceid={ceid}"
+
+
+def fetch_html_links(feed):
+    """Scrape article links off a section page — last resort for sites with
+    no RSS that Google News doesn't index (e.g. New Age)."""
+    resp = requests.get(feed["page"], headers=UA_HEADERS, timeout=25)
+    resp.raise_for_status()
+    seen, links = set(), []
+    for link in re.findall(feed["link_pattern"], resp.text):
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+    return links
 
 
 def resolve_gnews_link(link):
@@ -202,8 +222,26 @@ def collect_candidates():
     """Yield dicts: {url, title, source, lang, category} across all feeds."""
     candidates = []
     for feed in FEEDS:
-        url = feed["url"] if feed["type"] == "rss" else gnews_url(
-            feed["domain"], feed["lang"], feed.get("terms"))
+        if feed["type"] == "html":
+            try:
+                links = fetch_html_links(feed)
+            except Exception as exc:
+                log.warning("Feed failed [%s]: %s", feed["name"], exc)
+                continue
+            for link in links[:MAX_PER_SOURCE]:
+                candidates.append({
+                    "url": link,
+                    "title": "",  # filled from page metadata after extraction
+                    "source": feed["name"],
+                    "lang": feed["lang"],
+                    "origin": feed["origin"],
+                    "category": feed["default_category"],
+                })
+            log.info("Feed [%s]: kept %d item(s)", feed["name"],
+                     min(len(links), MAX_PER_SOURCE))
+            continue
+
+        url = feed["url"] if feed["type"] == "rss" else gnews_url(feed)
         try:
             parsed = fetch_feed(url)
         except Exception as exc:
@@ -250,7 +288,9 @@ def collect_candidates():
 # Article extraction
 # ----------------------------------------------------------------------------
 def extract_article(url):
-    """Return (text, author). Author comes from page metadata; often empty."""
+    """Return (text, author, meta_title). Author/title come from page
+    metadata; the title matters for html-scraped feeds whose section pages
+    only give us bare links."""
     try:
         resp = requests.get(url, headers=UA_HEADERS, timeout=30)
         resp.raise_for_status()
@@ -258,16 +298,17 @@ def extract_article(url):
             resp.text, include_comments=False, include_tables=False,
             favor_recall=True,
         )
-        author = ""
+        author = meta_title = ""
         try:
             meta = trafilatura.extract_metadata(resp.text)
             author = (getattr(meta, "author", None) or "").strip()
+            meta_title = (getattr(meta, "title", None) or "").strip()
         except Exception:
             pass
-        return (text or "").strip(), author
+        return (text or "").strip(), author, meta_title
     except Exception as exc:
         log.warning("Extraction failed [%s]: %s", url, exc)
-        return "", ""
+        return "", "", ""
 
 
 def detect_language(text):
@@ -548,9 +589,12 @@ def main():
             skipped += 1
             continue
 
-        text, author = extract_article(item["url"])
-        if len(text) < MIN_ARTICLE_CHARS:
-            log.info("Too short / paywalled, skipping: %s", item["title"][:60])
+        text, author, meta_title = extract_article(item["url"])
+        if not item["title"]:
+            item["title"] = meta_title  # html-scraped feeds start title-less
+        if len(text) < MIN_ARTICLE_CHARS or not item["title"]:
+            log.info("Too short / paywalled, skipping: %s",
+                     (item["title"] or item["url"])[:60])
             skipped += 1
             continue
 
