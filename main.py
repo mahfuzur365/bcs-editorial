@@ -62,9 +62,12 @@ PDF_STORAGE = os.environ.get("PDF_STORAGE", "github").lower()
 STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
 MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
 MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "15"))
-# Hard cap on Gemini requests per run: gate-rejected articles consume quota
-# too, so without this a news-heavy day could burn the free tier on rejects.
-MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "20"))
+# Hard cap on Gemini requests per run (saves + gate-rejections combined).
+# Current Flash models get ~1,500 free requests/day (the "20" once observed
+# was the leftover quota of the retired gemini-2.5-flash), so 40 is a safety
+# rail, not the binding constraint — MAX_TOTAL is. If Google quietly lowers
+# limits again, the DailyQuotaExhausted handler still stops the run cleanly.
+MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "40"))
 RECENCY_HOURS = 36
 MIN_ARTICLE_CHARS = 600
 GEMINI_COOLDOWN_SECONDS = 8  # free tier ≈ 10 requests/min → stay under it
