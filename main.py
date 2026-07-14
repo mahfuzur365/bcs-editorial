@@ -48,7 +48,7 @@ from firebase_admin import credentials, firestore, storage as fb_storage
 
 from google import genai
 
-from sources import FEEDS, TOPIC_KEYWORDS
+from sources import FEEDS, TOPIC_KEYWORDS, GNEWS_OPINION_TERMS
 
 # ----------------------------------------------------------------------------
 # Config
@@ -62,6 +62,9 @@ PDF_STORAGE = os.environ.get("PDF_STORAGE", "github").lower()
 STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
 MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
 MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "15"))
+# Hard cap on Gemini requests per run: gate-rejected articles consume quota
+# too, so without this a news-heavy day could burn the free tier on rejects.
+MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "20"))
 RECENCY_HOURS = 36
 MIN_ARTICLE_CHARS = 600
 GEMINI_COOLDOWN_SECONDS = 8  # free tier ≈ 10 requests/min → stay under it
@@ -79,13 +82,28 @@ TODAY = dt.datetime.now(dt.timezone.utc).astimezone(
 PDF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdfs", TODAY)
 
 SUMMARY_PROMPT = (
+    "You are the strict content gatekeeper AND summarizer for a BCS exam-prep "
+    "app that publishes ONLY opinion journalism.\n\n"
+    "STEP 1 — CLASSIFY the article below as exactly one of:\n"
+    '  "editorial" | "op-ed" | "column" | "analysis" | "news" | "other"\n'
+    "STRICT GATE: you must REJECT hard news, breaking news, press releases, "
+    "event coverage, and routine reporting. If the article merely reports what "
+    "happened (e.g., \"Prime Minister arrives in Barishal\", accident reports, "
+    "match results, announcements), it is \"news\". ONLY articles that are "
+    "explicitly editorials, op-eds, columns, or analytical opinion pieces "
+    "(argument, evaluation, or perspective by an author or the editorial "
+    "board) may pass.\n\n"
+    "If the type is \"news\" or \"other\", respond with EXACTLY this JSON and "
+    'nothing else: {"article_type": "news"}\n\n'
+    "STEP 2 — ONLY if the article passed the gate:\n"
     "Write a comprehensive summary of this article that captures the main theme "
     "and all vital points accurately. Do not make it too short; ensure no "
     "important information is missed. IF the original article is in English, "
     "ALSO extract 5-7 crucial advanced vocabulary words and provide their "
     "precise Bengali meanings.\n\n"
     "Respond ONLY with valid JSON in exactly this shape:\n"
-    '{"summary": "<the comprehensive summary>", '
+    '{"article_type": "<editorial|op-ed|column|analysis>", '
+    '"summary": "<the comprehensive summary>", '
     '"vocabulary": [{"word": "<english word>", "meaning_bn": "<precise Bengali meaning>"}]}\n'
     "If the article is NOT in English, return an empty list for \"vocabulary\".\n\n"
     "ARTICLE (source: {source}, title: {title}):\n{text}"
@@ -120,9 +138,13 @@ def fetch_feed(url):
     return feedparser.parse(resp.content)
 
 
-def gnews_url(domain, lang):
+def gnews_url(domain, lang, terms=None):
+    """Google News RSS query for a domain. `terms` narrows to opinion pieces;
+    None → language default from GNEWS_OPINION_TERMS, "" → no narrowing."""
     hl, gl, ceid = ("bn", "BD", "BD:bn") if lang == "bn" else ("en-US", "US", "US:en")
-    q = quote(f"site:{domain} when:1d")
+    if terms is None:
+        terms = GNEWS_OPINION_TERMS[lang]
+    q = quote(f"site:{domain} when:1d {terms}".strip())
     return f"https://news.google.com/rss/search?q={q}&hl={hl}&gl={gl}&ceid={ceid}"
 
 
@@ -180,7 +202,8 @@ def collect_candidates():
     """Yield dicts: {url, title, source, lang, category} across all feeds."""
     candidates = []
     for feed in FEEDS:
-        url = feed["url"] if feed["type"] == "rss" else gnews_url(feed["domain"], feed["lang"])
+        url = feed["url"] if feed["type"] == "rss" else gnews_url(
+            feed["domain"], feed["lang"], feed.get("terms"))
         try:
             parsed = fetch_feed(url)
         except Exception as exc:
@@ -202,6 +225,9 @@ def collect_candidates():
                     continue
             link = entry.get("link", "")
             if not link or not title:
+                continue
+            # e.g. Al Jazeera: only /opinions/ URLs are opinion pieces.
+            if feed.get("path_filter") and feed["path_filter"] not in link:
                 continue
             if feed["type"] == "gnews":
                 link = resolve_gnews_link(link)
@@ -324,6 +350,9 @@ def summarize(client, model, title, source, text):
             raw = (resp.text or "").strip()
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
             data = json.loads(raw)
+            article_type = str(data.get("article_type", "")).strip().lower()
+            if article_type in ("news", "other"):
+                return {"rejected": True, "article_type": article_type or "news"}
             if not isinstance(data.get("summary"), str) or not data["summary"]:
                 raise ValueError("missing summary field")
             vocab = data.get("vocabulary") or []
@@ -333,7 +362,12 @@ def summarize(client, model, title, source, text):
                 for v in vocab
                 if isinstance(v, dict) and v.get("word") and v.get("meaning_bn")
             ]
-            return {"summary": data["summary"].strip(), "vocabulary": vocab}
+            return {
+                "rejected": False,
+                "article_type": article_type or "analysis",
+                "summary": data["summary"].strip(),
+                "vocabulary": vocab,
+            }
         except Exception as exc:
             msg = str(exc)
             if "NOT_FOUND" in msg or "404" in msg:
@@ -498,11 +532,15 @@ def main():
     candidates = collect_candidates()
     log.info("Collected %d candidate article(s)", len(candidates))
 
-    processed = failed = skipped = 0
+    processed = failed = skipped = rejected = 0
+    gemini_calls = 0
     quota_gone = False
     for item in candidates:
         if processed >= MAX_TOTAL:
             log.info("Reached MAX_TOTAL=%d; stopping.", MAX_TOTAL)
+            break
+        if gemini_calls >= MAX_GEMINI_CALLS:
+            log.info("Reached MAX_GEMINI_CALLS=%d; stopping.", MAX_GEMINI_CALLS)
             break
 
         doc_id = hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:20]
@@ -520,6 +558,7 @@ def main():
         result = None
         while True:
             try:
+                gemini_calls += 1
                 result = summarize(gemini, model, item["title"], item["source"], text)
                 break
             except ModelUnavailable:
@@ -545,6 +584,11 @@ def main():
         if not result:
             failed += 1
             continue
+        if result.get("rejected"):
+            rejected += 1
+            log.info("Gatekeeper rejected (hard news): [%s] %s",
+                     item["source"], item["title"][:70])
+            continue
 
         pdf_url = None
         try:
@@ -560,6 +604,7 @@ def main():
             "source": item["source"],
             "origin": item["origin"],  # "national" | "international" toggle
             "author": author or None,
+            "articleType": result["article_type"],  # editorial|op-ed|column|analysis
             "category": item["category"],
             "language": language,
             "summary": result["summary"],
@@ -578,7 +623,8 @@ def main():
             {"dates": firestore.ArrayUnion([TODAY])}, merge=True
         )
 
-    log.info("Done. saved=%d skipped=%d failed=%d", processed, skipped, failed)
+    log.info("Done. saved=%d rejected=%d skipped=%d failed=%d gemini_calls=%d",
+             processed, rejected, skipped, failed, gemini_calls)
     if processed == 0 and (failed > 0 or quota_gone):
         sys.exit(1)  # nothing was saved despite trying → surface red in Actions
 
