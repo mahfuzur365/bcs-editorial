@@ -7,18 +7,15 @@ Flow:
   1. Pull latest items from configured RSS feeds / Google News fallbacks.
   2. Filter to the BCS-relevant topics in sources.py, dedupe against Firestore.
   3. Extract full article text (trafilatura).
-  4. Summarize + extract vocabulary with Gemini API (free tier, rate-limited).
-  5. Render a UTF-8 / Bengali-correct PDF (WeasyPrint → Pango/HarfBuzz shaping).
-  6. Store the PDF (GitHub repo by default, Firebase Storage optional).
-  7. Write the document to Firestore `(default)` database, `editorials` collection.
+  4. Gemini (free tier, rate-limited): gate by article type, then produce a
+     comprehensive summary, vocabulary, exam keywords, and punchlines.
+  5. Write the document — including the FULL article text for in-app reading —
+     to Firestore `(default)` database, `editorials` collection.
 
 Environment variables (see README.md):
   GEMINI_API_KEY               required
   FIREBASE_SERVICE_ACCOUNT     required (raw JSON of the service-account key)
   FIREBASE_SERVICE_ACCOUNT_FILE  alternative: path to the key file (local dev)
-  PDF_STORAGE                  "github" (default) | "firebase"
-  FIREBASE_STORAGE_BUCKET      required only when PDF_STORAGE=firebase
-  GITHUB_REPOSITORY / GITHUB_REF_NAME   set automatically by Actions
   GEMINI_MODEL                 optional override; by default the script asks the
                                API which models this key can use and picks the
                                newest Flash model (survives model retirements)
@@ -33,18 +30,16 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import time
 from urllib.parse import quote
-from uuid import uuid4
 
 import feedparser
 import requests
 import trafilatura
 
 import firebase_admin
-from firebase_admin import credentials, firestore, storage as fb_storage
+from firebase_admin import credentials, firestore
 
 from google import genai
 
@@ -58,8 +53,6 @@ log = logging.getLogger("editorial")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # optional override
-PDF_STORAGE = os.environ.get("PDF_STORAGE", "github").lower()
-STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "")
 MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
 MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "15"))
 # Hard cap on Gemini requests per run (saves + gate-rejections combined).
@@ -82,7 +75,9 @@ TODAY = dt.datetime.now(dt.timezone.utc).astimezone(
     dt.timezone(dt.timedelta(hours=6))  # Bangladesh Standard Time
 ).date().isoformat()
 
-PDF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdfs", TODAY)
+# Full article text stored on each doc for in-app reading. Firestore caps a
+# document at 1 MiB; 45k chars is ~135 KB even in 3-byte Bengali UTF-8.
+MAX_FULLTEXT_CHARS = 45000
 
 SUMMARY_PROMPT = (
     "You are the strict content gatekeeper AND summarizer for a BCS exam-prep "
@@ -98,17 +93,27 @@ SUMMARY_PROMPT = (
     "board) may pass.\n\n"
     "If the type is \"news\" or \"other\", respond with EXACTLY this JSON and "
     'nothing else: {"article_type": "news"}\n\n'
-    "STEP 2 — ONLY if the article passed the gate:\n"
-    "Write a comprehensive summary of this article that captures the main theme "
-    "and all vital points accurately. Do not make it too short; ensure no "
-    "important information is missed. IF the original article is in English, "
-    "ALSO extract 5-7 crucial advanced vocabulary words and provide their "
-    "precise Bengali meanings.\n\n"
+    "STEP 2 — ONLY if the article passed the gate, produce ALL of the "
+    "following for a BCS (Bangladesh Civil Service) exam candidate:\n"
+    "1. SUMMARY: a comprehensive summary that captures the main theme and all "
+    "vital points accurately. Do not make it too short; ensure no important "
+    "information is missed. End the summary with the key learning takeaway(s) "
+    "for the exam candidate.\n"
+    "2. VOCABULARY: IF the original article is in English, extract 5-7 crucial "
+    "advanced vocabulary words with their precise Bengali meanings. If the "
+    "article is NOT in English, return an empty list.\n"
+    "3. KEYWORDS: 5-8 exam-relevant key terms from the article (concepts, "
+    "names, treaties, data points — in the article's own language) that a "
+    "candidate should remember.\n"
+    "4. PUNCHLINES: 2-4 powerful, quotable sentences (each under 30 words, in "
+    "the article's own language) taken or distilled from the article, that a "
+    "candidate could reuse to elevate the quality of BCS written answers.\n\n"
     "Respond ONLY with valid JSON in exactly this shape:\n"
     '{"article_type": "<editorial|op-ed|column|analysis>", '
     '"summary": "<the comprehensive summary>", '
-    '"vocabulary": [{"word": "<english word>", "meaning_bn": "<precise Bengali meaning>"}]}\n'
-    "If the article is NOT in English, return an empty list for \"vocabulary\".\n\n"
+    '"vocabulary": [{"word": "<english word>", "meaning_bn": "<precise Bengali meaning>"}], '
+    '"keywords": ["<term>", "..."], '
+    '"punchlines": ["<quotable sentence>", "..."]}\n\n'
     "ARTICLE (source: {source}, title: {title}):\n{text}"
 )
 
@@ -126,8 +131,7 @@ def init_firebase():
     else:
         log.error("No Firebase credentials. Set FIREBASE_SERVICE_ACCOUNT secret.")
         sys.exit(1)
-    opts = {"storageBucket": STORAGE_BUCKET} if STORAGE_BUCKET else {}
-    firebase_admin.initialize_app(cred, opts)
+    firebase_admin.initialize_app(cred)
     return firestore.client()  # uses the (default) database ID
 
 
@@ -406,11 +410,17 @@ def summarize(client, model, title, source, text):
                 for v in vocab
                 if isinstance(v, dict) and v.get("word") and v.get("meaning_bn")
             ]
+            def str_list(key, cap):
+                items = data.get(key) or []
+                return [str(s).strip() for s in items if str(s).strip()][:cap]
+
             return {
                 "rejected": False,
                 "article_type": article_type or "analysis",
                 "summary": data["summary"].strip(),
                 "vocabulary": vocab,
+                "keywords": str_list("keywords", 10),
+                "punchlines": str_list("punchlines", 5),
             }
         except Exception as exc:
             msg = str(exc)
@@ -424,75 +434,6 @@ def summarize(client, model, title, source, text):
                 continue
             log.warning("Gemini attempt %d failed (%s); retrying in 8s", attempt, exc)
             time.sleep(8)
-    return None
-
-
-# ----------------------------------------------------------------------------
-# PDF generation (WeasyPrint — proper complex-script shaping for Bengali)
-# ----------------------------------------------------------------------------
-PDF_TEMPLATE = """
-<meta charset="utf-8">
-<style>
-  @page {{ size: A4; margin: 2cm 1.8cm; }}
-  body {{
-    font-family: "Noto Sans Bengali", "Noto Serif", "Noto Sans", sans-serif;
-    font-size: 11.5pt; line-height: 1.65; color: #1a1a1a;
-  }}
-  .meta {{ color: #555; font-size: 9.5pt; margin-bottom: 4px; }}
-  h1 {{ font-size: 17pt; line-height: 1.35; margin: 2px 0 10px; }}
-  hr {{ border: none; border-top: 1px solid #ccc; margin: 10px 0 16px; }}
-  p {{ margin: 0 0 10px; text-align: justify; }}
-  .footer {{ color: #888; font-size: 8.5pt; margin-top: 24px; }}
-</style>
-<div class="meta">{source} &nbsp;•&nbsp; {date} &nbsp;•&nbsp; {category}</div>
-<h1>{title}</h1>
-<hr>
-{paragraphs}
-<div class="footer">Original: {url}<br>Generated by BCS Mentor daily editorial pipeline.</div>
-"""
-
-
-def build_pdf(item, text, out_path):
-    from weasyprint import HTML  # imported lazily: needs system Pango libs
-    paragraphs = "".join(
-        f"<p>{html.escape(p.strip())}</p>"
-        for p in text.split("\n") if p.strip()
-    )
-    doc_html = PDF_TEMPLATE.format(
-        source=html.escape(item["source"]),
-        date=TODAY,
-        category=html.escape(item["category"]),
-        title=html.escape(item["title"]),
-        paragraphs=paragraphs,
-        url=html.escape(item["url"]),
-    )
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    HTML(string=doc_html).write_pdf(out_path)
-
-
-# ----------------------------------------------------------------------------
-# PDF storage
-# ----------------------------------------------------------------------------
-def store_pdf(local_path, doc_id):
-    """Return a public download URL, or None."""
-    if PDF_STORAGE == "firebase" and STORAGE_BUCKET:
-        try:
-            bucket = fb_storage.bucket()
-            blob = bucket.blob(f"editorial_pdfs/{TODAY}/{doc_id}.pdf")
-            token = uuid4().hex
-            blob.metadata = {"firebaseStorageDownloadTokens": token}
-            blob.upload_from_filename(local_path, content_type="application/pdf")
-            return (
-                f"https://firebasestorage.googleapis.com/v0/b/{bucket.name}/o/"
-                f"{quote(blob.name, safe='')}?alt=media&token={token}"
-            )
-        except Exception as exc:
-            log.warning("Firebase Storage upload failed (%s); keeping GitHub copy", exc)
-    # GitHub mode: the workflow commits pdfs/ back to the repo after this script.
-    repo = os.environ.get("GITHUB_REPOSITORY", "")
-    branch = os.environ.get("GITHUB_REF_NAME", "main")
-    if repo:
-        return f"https://raw.githubusercontent.com/{repo}/{branch}/pdfs/{TODAY}/{doc_id}.pdf"
     return None
 
 
@@ -527,26 +468,6 @@ def purge_previous_months(db, col):
         kept = sorted(d for d in dates if d >= month_start)
         if kept != sorted(dates):
             days_ref.set({"dates": kept})
-
-    # Old PDFs: Firebase Storage blobs in firebase mode; in github mode the
-    # local folders are deleted here and the workflow's commit removes them
-    # from the repo (raw.githubusercontent URLs die with them — their
-    # Firestore docs are already gone, so nothing links to them).
-    if PDF_STORAGE == "firebase" and STORAGE_BUCKET:
-        try:
-            bucket = fb_storage.bucket()
-            for blob in bucket.list_blobs(prefix="editorial_pdfs/"):
-                parts = blob.name.split("/")
-                if len(parts) >= 2 and parts[1] < month_start:
-                    blob.delete()
-        except Exception as exc:
-            log.warning("Storage purge failed: %s", exc)
-    pdf_root = os.path.dirname(PDF_DIR)
-    if os.path.isdir(pdf_root):
-        for name in os.listdir(pdf_root):
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", name) and name < month_start:
-                shutil.rmtree(os.path.join(pdf_root, name), ignore_errors=True)
-                log.info("Removed old PDF folder pdfs/%s", name)
 
 
 # ----------------------------------------------------------------------------
@@ -637,14 +558,6 @@ def main():
                      item["source"], item["title"][:70])
             continue
 
-        pdf_url = None
-        try:
-            local_pdf = os.path.join(PDF_DIR, f"{doc_id}.pdf")
-            build_pdf(item, text, local_pdf)
-            pdf_url = store_pdf(local_pdf, doc_id)
-        except Exception as exc:
-            log.warning("PDF step failed for %s: %s", item["title"][:60], exc)
-
         col.document(doc_id).set({
             "title": item["title"],
             "articleUrl": item["url"],
@@ -656,7 +569,9 @@ def main():
             "language": language,
             "summary": result["summary"],
             "vocabulary": result["vocabulary"],
-            "pdfUrl": pdf_url,
+            "keywords": result["keywords"],
+            "punchlines": result["punchlines"],
+            "fullText": text[:MAX_FULLTEXT_CHARS],
             "date": TODAY,
             "createdAt": firestore.SERVER_TIMESTAMP,
         })
