@@ -23,34 +23,33 @@ Environment variables (see README.md):
   MAX_TOTAL                    default 15   (keeps Gemini free tier safe)
 """
 
-import datetime as dt
 import hashlib
-import html
-import json
-import logging
 import os
 import re
 import sys
 import time
 from urllib.parse import quote
 
-import feedparser
 import requests
-import trafilatura
 
-import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import firestore
 
 from google import genai
 
 from sources import FEEDS, TOPIC_KEYWORDS, GNEWS_OPINION_TERMS
 
+# Fetching, extraction, encoding hygiene and Gemini plumbing are shared with
+# the weekly current-affairs pipeline (updates.py) — see common.py.
+from common import (
+    log, UA_HEADERS, today_bst, init_firebase, fetch_feed, resolve_gnews_link,
+    extract_article, plain_text, looks_mojibake, detect_language,
+    entry_age_hours, pick_model, generate_json,
+    ModelUnavailable, DailyQuotaExhausted,
+)
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("editorial")
-
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")  # optional override
 MAX_PER_SOURCE = int(os.environ.get("MAX_PER_SOURCE", "2"))
@@ -65,15 +64,7 @@ RECENCY_HOURS = 36
 MIN_ARTICLE_CHARS = 600
 GEMINI_COOLDOWN_SECONDS = 8  # free tier ≈ 10 requests/min → stay under it
 
-UA_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
-}
-
-TODAY = dt.datetime.now(dt.timezone.utc).astimezone(
-    dt.timezone(dt.timedelta(hours=6))  # Bangladesh Standard Time
-).date().isoformat()
+TODAY = today_bst()  # Bangladesh Standard Time — the app's notion of "today"
 
 # Full article text stored on each doc for in-app reading. Firestore caps a
 # document at 1 MiB; 45k chars is ~135 KB even in 3-byte Bengali UTF-8.
@@ -118,32 +109,6 @@ SUMMARY_PROMPT = (
 )
 
 
-# ----------------------------------------------------------------------------
-# Firebase
-# ----------------------------------------------------------------------------
-def init_firebase():
-    key_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "")
-    key_file = os.environ.get("FIREBASE_SERVICE_ACCOUNT_FILE", "")
-    if key_json:
-        cred = credentials.Certificate(json.loads(key_json))
-    elif key_file:
-        cred = credentials.Certificate(key_file)
-    else:
-        log.error("No Firebase credentials. Set FIREBASE_SERVICE_ACCOUNT secret.")
-        sys.exit(1)
-    firebase_admin.initialize_app(cred)
-    return firestore.client()  # uses the (default) database ID
-
-
-# ----------------------------------------------------------------------------
-# Feed collection
-# ----------------------------------------------------------------------------
-def fetch_feed(url):
-    """Fetch a feed with a browser UA (many BD sites block default clients)."""
-    resp = requests.get(url, headers=UA_HEADERS, timeout=25)
-    resp.raise_for_status()
-    return feedparser.parse(resp.content)
-
 
 def gnews_url(feed):
     """Google News RSS query for a feed. `domain` may include a URL path
@@ -175,25 +140,13 @@ def fetch_html_links(feed):
     return links
 
 
-def resolve_gnews_link(link):
-    """Google News RSS links are redirects; decode to the real article URL."""
-    try:
-        from googlenewsdecoder import gnewsdecoder
-        result = gnewsdecoder(link, interval=1)
-        if result.get("status"):
-            return result["decoded_url"]
-    except Exception as exc:
-        log.warning("Google News link decode failed: %s", exc)
-    return None
-
 
 def is_recent(entry):
-    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-    if not parsed:
-        return True  # many opinion feeds omit dates; accept and rely on dedupe
-    published = dt.datetime(*parsed[:6], tzinfo=dt.timezone.utc)
-    age = dt.datetime.now(dt.timezone.utc) - published
-    return age <= dt.timedelta(hours=RECENCY_HOURS)
+    """Many opinion feeds omit dates, and some send unusable ones (see
+    entry_age_hours) — in both cases accept the item and rely on dedupe."""
+    age = entry_age_hours(entry)
+    return age is None or age <= RECENCY_HOURS
+
 
 
 def _keyword_pattern(kw):
@@ -260,8 +213,8 @@ def collect_candidates():
                 break
             if not is_recent(entry):
                 continue
-            title = html.unescape(entry.get("title", "")).strip()
-            snippet = re.sub(r"<[^>]+>", " ", entry.get("summary", ""))
+            title = plain_text(entry.get("title", ""))
+            snippet = plain_text(entry.get("summary", ""))
             category, score = match_category(f"{title} {snippet}")
             if not category:
                 if feed.get("always_include"):
@@ -291,150 +244,42 @@ def collect_candidates():
     return candidates
 
 
-# ----------------------------------------------------------------------------
-# Article extraction
-# ----------------------------------------------------------------------------
-def extract_article(url):
-    """Return (text, author, meta_title). Author/title come from page
-    metadata; the title matters for html-scraped feeds whose section pages
-    only give us bare links."""
-    try:
-        resp = requests.get(url, headers=UA_HEADERS, timeout=30)
-        resp.raise_for_status()
-        text = trafilatura.extract(
-            resp.text, include_comments=False, include_tables=False,
-            favor_recall=True,
-        )
-        author = meta_title = ""
-        try:
-            meta = trafilatura.extract_metadata(resp.text)
-            author = (getattr(meta, "author", None) or "").strip()
-            meta_title = (getattr(meta, "title", None) or "").strip()
-        except Exception:
-            pass
-        return (text or "").strip(), author, meta_title
-    except Exception as exc:
-        log.warning("Extraction failed [%s]: %s", url, exc)
-        return "", "", ""
-
-
-def detect_language(text):
-    """'bn' if a meaningful share of characters are in the Bengali block."""
-    if not text:
-        return "en"
-    bengali = sum(1 for ch in text if "ঀ" <= ch <= "৿")
-    letters = sum(1 for ch in text if ch.isalpha())
-    return "bn" if letters and bengali / letters > 0.3 else "en"
-
-
-# ----------------------------------------------------------------------------
-# Gemini summarization
-# ----------------------------------------------------------------------------
-class ModelUnavailable(Exception):
-    """The model returned 404 — retired/unavailable for this API key."""
-
-
-class DailyQuotaExhausted(Exception):
-    """Free-tier requests-per-day quota is gone; it won't reset mid-run."""
-
-
-def list_usable_models(client):
-    """Model names this API key can call generateContent on."""
-    names = []
-    try:
-        for m in client.models.list():
-            name = (getattr(m, "name", "") or "").removeprefix("models/")
-            actions = getattr(m, "supported_actions", None) or []
-            if name and (not actions or "generateContent" in actions):
-                names.append(name)
-    except Exception as exc:
-        log.warning("Could not list Gemini models: %s", exc)
-    return names
-
-
-def pick_model(client, exclude=()):
-    """Pick the best available Flash model. Hardcoding a model name broke once
-    already (gemini-2.5-flash was retired for new keys), so ask the API."""
-    preferred = [p for p in (
-        GEMINI_MODEL,               # explicit override wins if usable
-        "gemini-flash-latest",      # rolling alias maintained by Google
-        "gemini-flash-lite-latest",
-    ) if p and p not in exclude]
-
-    available = [n for n in list_usable_models(client) if n not in exclude]
-    for p in preferred:
-        if p in available:
-            return p
-
-    flashes = [
-        n for n in available
-        if n.startswith("gemini") and "flash" in n
-        and not any(x in n for x in ("image", "tts", "live", "audio", "embed"))
-    ]
-    if flashes:
-        def rank(n):
-            m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
-            version = float(m.group(1)) if m else 0.0
-            return (version, "lite" not in n, "preview" not in n)
-        return max(flashes, key=rank)
-
-    # Listing failed entirely → fall back to trying the rolling aliases blind.
-    return preferred[0] if preferred else None
-
 
 def summarize(client, model, title, source, text):
-    """Return {"summary", "vocabulary"} or None (bad output after retries).
-    Raises ModelUnavailable / DailyQuotaExhausted — the caller must react,
-    retrying those here would only burn the daily quota for nothing."""
+    """Return the gate verdict plus the summary payload, or None when the model
+    kept returning unusable output. Raises ModelUnavailable /
+    DailyQuotaExhausted (via generate_json) — the caller must react to those."""
     prompt = SUMMARY_PROMPT.replace("{source}", source).replace("{title}", title) \
                            .replace("{text}", text[:30000])
-    for attempt in range(1, 4):
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config={"response_mime_type": "application/json", "temperature": 0.4},
-            )
-            raw = (resp.text or "").strip()
-            raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
-            data = json.loads(raw)
-            article_type = str(data.get("article_type", "")).strip().lower()
-            if article_type in ("news", "other"):
-                return {"rejected": True, "article_type": article_type or "news"}
-            if not isinstance(data.get("summary"), str) or not data["summary"]:
-                raise ValueError("missing summary field")
-            vocab = data.get("vocabulary") or []
-            vocab = [
-                {"word": str(v.get("word", "")).strip(),
-                 "meaning_bn": str(v.get("meaning_bn", "")).strip()}
-                for v in vocab
-                if isinstance(v, dict) and v.get("word") and v.get("meaning_bn")
-            ]
-            def str_list(key, cap):
-                items = data.get(key) or []
-                return [str(s).strip() for s in items if str(s).strip()][:cap]
+    data = generate_json(client, model, prompt, temperature=0.4)
+    if not isinstance(data, dict):
+        return None
 
-            return {
-                "rejected": False,
-                "article_type": article_type or "analysis",
-                "summary": data["summary"].strip(),
-                "vocabulary": vocab,
-                "keywords": str_list("keywords", 10),
-                "punchlines": str_list("punchlines", 5),
-            }
-        except Exception as exc:
-            msg = str(exc)
-            if "NOT_FOUND" in msg or "404" in msg:
-                raise ModelUnavailable(model) from exc
-            if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                if "PerDay" in msg or "per day" in msg.lower():
-                    raise DailyQuotaExhausted(model) from exc
-                log.warning("Gemini rate-limited (attempt %d); waiting 40s", attempt)
-                time.sleep(40)
-                continue
-            log.warning("Gemini attempt %d failed (%s); retrying in 8s", attempt, exc)
-            time.sleep(8)
-    return None
+    article_type = str(data.get("article_type", "")).strip().lower()
+    if article_type in ("news", "other"):
+        return {"rejected": True, "article_type": article_type or "news"}
+    if not isinstance(data.get("summary"), str) or not data["summary"]:
+        return None
+
+    vocab = [
+        {"word": str(v.get("word", "")).strip(),
+         "meaning_bn": str(v.get("meaning_bn", "")).strip()}
+        for v in (data.get("vocabulary") or [])
+        if isinstance(v, dict) and v.get("word") and v.get("meaning_bn")
+    ]
+
+    def str_list(key, cap):
+        items = data.get(key) or []
+        return [str(s).strip() for s in items if str(s).strip()][:cap]
+
+    return {
+        "rejected": False,
+        "article_type": article_type or "analysis",
+        "summary": data["summary"].strip(),
+        "vocabulary": vocab,
+        "keywords": str_list("keywords", 10),
+        "punchlines": str_list("punchlines", 5),
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -487,7 +332,7 @@ def main():
     except Exception as exc:
         log.warning("Monthly purge failed (continuing): %s", exc)
 
-    model = pick_model(gemini)
+    model = pick_model(gemini, override=GEMINI_MODEL)
     if not model:
         log.error("No usable Gemini model found for this API key.")
         sys.exit(1)
@@ -514,11 +359,21 @@ def main():
             continue
 
         text, author, meta_title = extract_article(item["url"])
+        # html-scraped feeds start title-less; a feed title that was nothing but
+        # markup also cleans down to "" and falls back to the page's own title.
         if not item["title"]:
-            item["title"] = meta_title  # html-scraped feeds start title-less
+            item["title"] = meta_title
         if len(text) < MIN_ARTICLE_CHARS or not item["title"]:
             log.info("Too short / paywalled, skipping: %s",
                      (item["title"] or item["url"])[:60])
+            skipped += 1
+            continue
+        # A mis-decoded page reads as gibberish to a student and would waste a
+        # Gemini call producing a summary of nonsense. Drop it loudly instead —
+        # a spike in these means a source changed how it declares its charset.
+        if looks_mojibake(text) or looks_mojibake(item["title"]):
+            log.warning("Garbled text (encoding), skipping: [%s] %s",
+                        item["source"], item["url"][:80])
             skipped += 1
             continue
 
@@ -532,7 +387,7 @@ def main():
             except ModelUnavailable:
                 dead_models.add(model)
                 log.warning("Model %s unavailable for this key; picking another", model)
-                model = pick_model(gemini, exclude=dead_models)
+                model = pick_model(gemini, exclude=dead_models, override=GEMINI_MODEL)
                 if not model:
                     log.error("Ran out of usable Gemini models; stopping run.")
                     quota_gone = True

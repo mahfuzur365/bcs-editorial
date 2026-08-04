@@ -30,6 +30,10 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
+      # Catches a syntax error in seconds instead of after a long crawl.
+      - name: Syntax check
+        run: python -m compileall -q main.py updates.py common.py sources.py update_sources.py
+
       - name: Run pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

@@ -160,3 +160,133 @@ inline full text), monthly archive. [frontend/editorials.js](frontend/editorials
 here is a standalone reference copy of the data layer.
 Bengali TTS (`bn-BD`) is built into Google TTS on Android; desktop browser
 support varies.
+
+---
+
+# Weekly Current-Affairs Pipeline (`updates.py`)
+
+Feeds the app's **সাম্প্রতিক আপডেট** section.
+
+**Collects daily, published weekly.** The workflow runs every morning at 08:00
+BST and files a few drafts; you approve a week's worth at `/admin/updates`
+whenever suits — typically Friday, the app's revision day, so the week's current
+affairs reach students as they sit down to review.
+
+### Why daily collection, not one weekly run
+
+Measured across all 18 queries on a real week:
+
+| | one weekly run | daily runs |
+|---|---|---|
+| matching articles published that week | 1,185 | 1,185 |
+| candidates actually examined | 54 (**4.6%**) | ~378 (**~7×**) |
+| queries truncated by Google's 100-item RSS cap | 5 of 18 | 0 of 18 |
+| cost of one failed run | the whole week, unrecoverable | one day |
+
+The RSS cap is the decisive one: at `when:7d` five of these queries return
+exactly 100 results, so a weekly run **cannot see** the rest of the week however
+many items it takes. At `when:2d` the same queries return 13–75, well clear of
+the cap.
+
+The 2-day window overlaps by a day on purpose, so a failed run is covered by the
+next one. Repeats cost a single Firestore read — the URL-hash dedupe check runs
+before extraction and before any Gemini call.
+
+To revert to weekly: set `SEARCH_WINDOW = "7d"` in `update_sources.py` and the
+cron to `"0 1 * * 5"`.
+
+`main.py` collects **opinion to be read**; this collects **facts to be
+memorised**. That difference drives every design choice below.
+
+## How "exam-relevant" is decided
+
+General news is mostly not exam material: a week of headlines is dominated by
+accidents, court dates and party statements, none of which a BCS or bank
+question will ever ask about. Relevance is therefore filtered in four layers:
+
+1. **Query shape** (`update_sources.py` → `EXAM_QUERIES`). We do not browse the
+   news. We run 18 searches shaped like the questions exams actually ask —
+   *who was appointed*, *what rank did Bangladesh get*, *which treaty was
+   signed*, *who won what*. A question-shaped query returns question-shaped
+   articles. Each entry describes a **category of fact**, not a topic:
+   "অর্থনীতি" returns opinion columns, "রিজার্ভ কত বিলিয়ন" returns a number.
+2. **Wire feeds** (`NEWS_FEEDS`) — BSS and UN News, whose routine output is
+   disproportionately the record-keeping kind of fact exams draw from.
+3. **Blocklist** (`BLOCK_PATTERNS`) — title-only rejection before any network
+   or API cost. ASCII patterns match on word boundaries, so "vs" cannot fire
+   inside "advisers". Cheap insurance, not the main filter.
+4. **Gemini rubric** (`RELEVANCE_PROMPT`) — scores 0–10 on *"how likely is a
+   fact from this to appear as an MCQ in the next two years?"*, with worked
+   examples of what scores 8–10 and what is an automatic reject. Below
+   `UPDATES_MIN_SCORE` (default 6) the article is dropped.
+
+A final `has_concrete_fact()` check rejects notes whose bullets carry no number,
+date or proper noun — a note nobody can be examined on.
+
+## Drafts, not publications
+
+Items are written with `status: "draft"` and are **invisible to students** until
+an admin approves them at `/admin/updates`. Students memorise these as fact, so
+a wrong rank or date is worse than an empty section. The review screen shows
+every bullet point plus a link to the source for checking. Set
+`UPDATES_AUTO_PUBLISH=1` to skip approval (not recommended).
+
+`firestore.rules` enforces this: `allow read: if isAdmin() || resource.data.status == 'published'`.
+Because that is a per-document rule, a client listing the collection **must**
+filter `where("status", "==", "published")` or Firestore rejects the whole query
+— which is what `getUpdates()` in the app does.
+
+## Firestore shape (`updates` collection)
+
+| field | example |
+|---|---|
+| `title` | `"বাংলাদেশ-দক্ষিণ কোরিয়া সেপা চুক্তি স্বাক্ষরিত"` |
+| `points` | `["...", "...", "..."]` (3–5 Bengali facts) |
+| `category` | `bangladesh` \| `international` \| `science` \| `economy` \| `environment` \| `sports` |
+| `status` | `draft` \| `published` |
+| `score` | `8` (Gemini's exam-relevance rating, shown in the admin queue) |
+| `source`, `sourceUrl` | for verification before approving |
+| `date`, `createdAt`, `publishedAt` | |
+
+## Gemini key: use a second one
+
+The two pipelines are separate GitHub workflows (`main.yml` daily,
+`updates.yml` Friday) and should use **separate Gemini keys**.
+
+On Fridays both run an hour apart. Sharing one key means the editorial run can
+spend its quota first and leave this one starved — and the free-tier allowance
+has shrunk without warning before (the pipeline once found itself with 20
+requests, the leftover quota of a retired model).
+
+> **The catch:** Gemini free-tier quota is metered **per Google Cloud project**,
+> not per key. A second key created inside the *same* AI Studio project shares
+> the same daily allowance and buys you nothing. Create a **new project** in AI
+> Studio and mint the key there.
+
+Setup:
+
+1. AI Studio → new project → **Get API key**.
+2. GitHub repo → Settings → Secrets and variables → Actions → **New secret**
+   named `UPDATES_GEMINI_API_KEY`.
+
+Until that secret exists the pipeline falls back to `GEMINI_API_KEY` and logs
+a warning saying so, so nothing breaks in the meantime.
+
+## Tuning
+
+| variable | default | effect |
+|---|---|---|
+| `UPDATES_MAX_ITEMS` | 5 | drafts per daily run (~35/week to choose from) |
+| `UPDATES_MIN_SCORE` | 6 | raise to 7–8 for a stricter section |
+| `UPDATES_MAX_GEMINI_CALLS` | 30 | safety rail, per run |
+| `UPDATES_AUTO_PUBLISH` | 0 | 1 = publish without review |
+
+Both can be overridden from the workflow's **Run workflow** button.
+
+## Shared code
+
+`common.py` holds what both pipelines need — feed fetching, Google News link
+decoding, article extraction, encoding hygiene, Gemini model selection and JSON
+calls. It exists because the ISO-8859-1 decoding bug (Bengali pages served
+without a charset header came out as mojibake) would otherwise have been fixed
+in one pipeline and silently inherited by the other.
