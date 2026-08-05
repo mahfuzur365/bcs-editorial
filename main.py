@@ -1,7 +1,7 @@
 """
 Daily Editorial Pipeline — BCS Mentor
 =====================================
-Runs on GitHub Actions (free tier) every day at 06:00 Bangladesh time.
+Runs on GitHub Actions (free tier) every day at 05:00 Bangladesh time.
 
 Flow:
   1. Pull latest items from configured RSS feeds / Google News fallbacks.

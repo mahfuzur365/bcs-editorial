@@ -1,11 +1,16 @@
-# Daily editorial pipeline — runs at 06:00 Bangladesh time (00:00 UTC).
+# Daily editorial pipeline — runs at 05:00 Bangladesh time (23:00 UTC).
 # Free tier: GitHub Actions public repos have unlimited minutes;
 # this run takes ~5 minutes.
 name: daily-editorials
 
 on:
   schedule:
-    - cron: "0 0 * * *"        # 00:00 UTC == 06:00 AM BST (UTC+6)
+    # 23:00 UTC == 05:00 Bangladesh time (UTC+6) on the NEXT calendar day.
+    # GitHub queues scheduled runs on a best-effort basis and can start them
+    # late when its schedulers are busy — sometimes by tens of minutes. That is
+    # tolerable here because the app falls back to the previous day's edition
+    # until new content lands, so a late run is invisible to a student.
+    - cron: "0 23 * * *"
   workflow_dispatch: {}         # manual "Run workflow" button for testing
 
 concurrency:

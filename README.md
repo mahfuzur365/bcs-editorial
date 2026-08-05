@@ -10,7 +10,7 @@ exam keywords, quotable punchlines, and the **full article text for in-app
 reading** — to **Firestore (Spark plan, `(default)` database)**.
 
 ```
-GitHub Actions (cron 06:00 BST)
+GitHub Actions (cron 05:00 BST)
   → opinion-section RSS + Google News fallback + HTML scrape (New Age)
   → full text + author/title extraction (trafilatura)
   → Gemini Flash (auto-selected newest model):

@@ -1,9 +1,11 @@
 # Current-affairs pipeline — COLLECTS DAILY, you PUBLISH WEEKLY.
 #
-# Runs every morning at 08:00 Bangladesh time (two hours after the editorial
-# pipeline, so the two never overlap) and files a few drafts. Nothing reaches
-# students until you approve them at /admin/updates — do that once a week,
-# typically Friday, the app's revision day.
+# Runs every morning at 05:00 Bangladesh time, alongside the editorial pipeline.
+# The two can run together because they use separate Gemini keys from separate
+# AI Studio projects, so neither can exhaust the other's quota.
+#
+# Nothing reaches students until you approve the drafts at /admin/updates — do
+# that once a week, typically Friday, the app's revision day.
 #
 # Daily rather than one weekly run because a single run samples under 5% of the
 # week's matching articles, Google News truncates a 7-day query at 100 items,
@@ -12,7 +14,10 @@ name: current-affairs
 
 on:
   schedule:
-    - cron: "0 2 * * *"        # 02:00 UTC daily == 08:00 AM BST (UTC+6)
+    # 23:00 UTC == 05:00 Bangladesh time (UTC+6) on the NEXT calendar day.
+    # GitHub may start a scheduled run late under load; harmless here, because
+    # the app keeps showing the previous content until the new batch arrives.
+    - cron: "0 23 * * *"
   workflow_dispatch:            # manual "Run workflow" button
     inputs:
       max_items:
