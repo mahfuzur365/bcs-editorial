@@ -318,6 +318,84 @@ def purge_previous_months(db, col):
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Dashboard showcase
+# ----------------------------------------------------------------------------
+# The dashboard's slider is a shop window, not a reader: a headline, two lines,
+# and a way through to the real reading view. Letting it query `editorials`
+# meant downloading whole documents — each carries the full article text, up to
+# 45,000 characters, so the app can read offline — to render a preview. Six of
+# those is hundreds of KB over mobile data for a strip nobody reads in place.
+#
+# So the pipeline publishes the strip itself: ONE small document the dashboard
+# fetches in a single read, a few KB total, no article bodies anywhere near it.
+
+SHOWCASE_NATIONAL = ["Prothom Alo", "The Daily Star"]   # in display order
+SHOWCASE_INTERNATIONAL_MAX = 2
+SHOWCASE_MAX = 4
+
+
+def pick_showcase(saved):
+    """Choose the day's showcase: the two flagship national papers, then one or
+    two international pieces. Falls back to any other national source when a
+    flagship published nothing worth keeping that day, so the strip is never
+    short just because one feed was quiet."""
+    by_source = {}
+    for item in saved:
+        by_source.setdefault(item["source"], []).append(item)
+
+    chosen, used = [], set()
+
+    def take(item):
+        if item["id"] in used:
+            return False
+        used.add(item["id"])
+        chosen.append(item)
+        return True
+
+    # 1 — the flagship national papers, in order.
+    for name in SHOWCASE_NATIONAL:
+        for item in by_source.get(name, [])[:1]:
+            take(item)
+
+    # 2 — top up the national half from any other national source.
+    national_target = len(SHOWCASE_NATIONAL)
+    if sum(1 for c in chosen if c["origin"] == "national") < national_target:
+        for item in saved:
+            if item["origin"] != "national":
+                continue
+            if sum(1 for c in chosen if c["origin"] == "national") >= national_target:
+                break
+            take(item)
+
+    # 3 — one or two international pieces.
+    intl = 0
+    for item in saved:
+        if intl >= SHOWCASE_INTERNATIONAL_MAX or len(chosen) >= SHOWCASE_MAX:
+            break
+        if item["origin"] == "international" and take(item):
+            intl += 1
+
+    return chosen[:SHOWCASE_MAX]
+
+
+def write_showcase(db, saved):
+    """Replace (not merge) the showcase document with today's strip."""
+    items = pick_showcase(saved)
+    if not items:
+        return
+    try:
+        db.collection("editorial_meta").document("showcase").set({
+            "date": TODAY,
+            "items": items,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        })
+        log.info("Showcase: %d item(s) — %s", len(items),
+                 ", ".join(i["source"] for i in items))
+    except Exception as exc:
+        log.warning("Showcase write failed (continuing): %s", exc)
+
+
 def main():
     if not GEMINI_API_KEY:
         log.error("GEMINI_API_KEY is not set.")
@@ -342,6 +420,7 @@ def main():
     candidates = collect_candidates()
     log.info("Collected %d candidate article(s)", len(candidates))
 
+    saved_today = []   # compact records for the dashboard showcase
     processed = failed = skipped = rejected = 0
     gemini_calls = 0
     quota_gone = False
@@ -431,6 +510,16 @@ def main():
             "createdAt": firestore.SERVER_TIMESTAMP,
         })
         processed += 1
+        saved_today.append({
+            "id": doc_id,
+            "title": item["title"],
+            # Two lines' worth on a phone. The showcase never shows more, and
+            # sending more would defeat the point of a lightweight document.
+            "excerpt": " ".join(result["summary"].split())[:180],
+            "source": item["source"],
+            "origin": item["origin"],
+            "category": item["category"],
+        })
         log.info("Saved [%s] %s", item["source"], item["title"][:70])
 
     if processed:
@@ -439,6 +528,7 @@ def main():
         db.collection("editorial_meta").document("days").set(
             {"dates": firestore.ArrayUnion([TODAY])}, merge=True
         )
+        write_showcase(db, saved_today)
 
     log.info("Done. saved=%d rejected=%d skipped=%d failed=%d gemini_calls=%d",
              processed, rejected, skipped, failed, gemini_calls)
