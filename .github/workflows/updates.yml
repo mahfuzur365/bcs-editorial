@@ -1,8 +1,13 @@
 # Current-affairs pipeline — COLLECTS DAILY, you PUBLISH WEEKLY.
 #
-# Runs every morning at 05:00 Bangladesh time, alongside the editorial pipeline.
-# The two can run together because they use separate Gemini keys from separate
-# AI Studio projects, so neither can exhaust the other's quota.
+# Runs every morning at 05:30 Bangladesh time, half an hour after the editorial
+# pipeline. The two use separate Gemini keys from separate Google ACCOUNTS, so
+# neither can exhaust the other's quota — which is why this pipeline kept
+# working through the 16 days the editorial one produced nothing.
+#
+# The half-hour stagger is belt-and-braces: it only matters if the two ever end
+# up sharing a key, in which case starting together would put them into each
+# other's per-minute rate limit.
 #
 # Nothing reaches students until you approve the drafts at /admin/updates — do
 # that once a week, typically Friday, the app's revision day.
@@ -14,10 +19,11 @@ name: current-affairs
 
 on:
   schedule:
-    # 23:00 UTC == 05:00 Bangladesh time (UTC+6) on the NEXT calendar day.
-    # GitHub may start a scheduled run late under load; harmless here, because
-    # the app keeps showing the previous content until the new batch arrives.
-    - cron: "0 23 * * *"
+    # 23:30 UTC == 05:30 Bangladesh time (UTC+6) on the NEXT calendar day.
+    # GitHub may start a scheduled run late under load — observed drift is
+    # 1.5-2.7 hours — which is harmless here, because the app keeps showing the
+    # previous content until the new batch arrives.
+    - cron: "30 23 * * *"
   workflow_dispatch:            # manual "Run workflow" button
     inputs:
       max_items:
@@ -39,7 +45,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Was 60. See main.yml: back-off is now budgeted, so a quota-dead key
+    # ends the run in minutes instead of consuming the whole job.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 

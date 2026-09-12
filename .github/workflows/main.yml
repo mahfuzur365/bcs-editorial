@@ -23,7 +23,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Was 45. A healthy run takes 4-15 minutes; the only thing that ever used
+    # the other 30 was Gemini back-off on a key with no quota, which now has
+    # its own budget (GEMINI_SLEEP_BUDGET) and stops the run instead. Keeping
+    # this tight means a genuine hang shows up as a timeout the same morning
+    # rather than hiding inside a plausible-looking 45-minute job.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
