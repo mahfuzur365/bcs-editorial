@@ -47,5 +47,28 @@ jobs:
       - name: Run pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional spare key, tried when the one above is out of credit or
+          # allowance. Rotation retries the same article, so nothing is lost.
+          GEMINI_API_KEY_FALLBACK: ${{ secrets.GEMINI_API_KEY_FALLBACK }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+          # ---- free-tier budget -------------------------------------------
+          # Pinned deliberately. "gemini-flash-latest" is hot-swapped by
+          # Google with every Flash release, and their docs note that latest
+          # aliases "will typically have billing enabled" — a poor fit for a
+          # run that must survive on the free tier. A pinned stable model also
+          # makes cost predictable if this ever moves to a paid key.
+          GEMINI_MODEL: gemini-2.5-flash
+
+          # Measured 2026-09-12: a free-tier key on this account serves
+          # ~10-16 requests/day before Google returns a per-day 429, while
+          # MAX_TOTAL=15 needed ~20. Green August runs averaged ~1.33 requests
+          # per saved article (the gatekeeper spends one on each rejection
+          # too), so 6 articles ~= 8 requests and fits with room to spare.
+          #
+          # This is the deliberate free-tier setting, not a limit of the
+          # pipeline. Raise MAX_TOTAL back to 15 and MAX_GEMINI_CALLS to 40
+          # once the key has credit; nothing else needs to change.
+          MAX_TOTAL: "6"
+          MAX_GEMINI_CALLS: "12"
         run: python main.py

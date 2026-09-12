@@ -74,4 +74,8 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           UPDATES_MAX_ITEMS: ${{ inputs.max_items || '5' }}
           UPDATES_MIN_SCORE: ${{ inputs.min_score || '6' }}
+          # Pinned for the same reason as main.yml: the "-latest" alias is
+          # hot-swapped by Google and their docs say such aliases typically
+          # have billing enabled, which is the wrong bet on a free-tier key.
+          GEMINI_MODEL: gemini-2.5-flash
         run: python updates.py
