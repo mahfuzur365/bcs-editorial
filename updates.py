@@ -48,13 +48,17 @@ A second key minted inside the same project shares the same daily allowance and
 buys nothing — it must come from a different project to give this pipeline
 independent headroom. In practice this pipeline's key comes from a different
 Google ACCOUNT, which is stronger still, and is why it kept working from
-2026-08-28 while the editorial key's free-tier grant decayed to zero.
+2026-08-28 while the editorial key stopped entirely.
 
-Treat the free tier as small and unstable rather than as a documented number.
-On the editorial key it fell from ~20 requests/day to ~6 over a fortnight and
-then to zero, with demand flat throughout. So: count real requests (GeminiStats
-does, not logical calls), budget back-off (GEMINI_SLEEP_BUDGET), and stop on
-QuotaBlocked instead of sleeping through the job's timeout.
+That outage was billing, not quota: the editorial account runs on PREPAID
+CREDITS and the balance drained — ~20 requests/day until 2026-08-13, ~6/day by
+2026-08-27, zero from 2026-08-28, with demand flat throughout. Its 429s said
+"Your prepayment credits are depleted" and carried no "PerDay" marker, so they
+were mistaken for rate-limiting and slept off for ~40 minutes a run.
+
+So: count real requests (GeminiStats does, not logical calls), budget back-off
+(GEMINI_SLEEP_BUDGET), and stop on QuotaBlocked rather than sleeping through
+the job's timeout. A 429 is not automatically something to wait out.
 """
 
 import datetime as dt
@@ -80,9 +84,9 @@ from firebase_admin import firestore
 
 # Prefer this pipeline's own key; fall back to the shared one so the run still
 # works before the second secret is added. Either variable may hold several
-# comma-separated keys, and they are tried in order — a key whose free-tier
-# grant has been zeroed 429s every request, and rotating past it beats
-# returning an empty week.
+# comma-separated keys, and they are tried in order — a key on an account with
+# no credit left 429s every request, and rotating past it beats returning an
+# empty week.
 API_KEYS = gemini_keys("UPDATES_GEMINI_API_KEY", "GEMINI_API_KEY")
 OWN_KEY = bool(os.environ.get("UPDATES_GEMINI_API_KEY"))
 
@@ -466,8 +470,8 @@ def main():
                 log.error("Gemini key %s is blocked: %s",
                           API_KEYS[key_index][0], exc)
                 if not rotate_key():
-                    log.error("No Gemini key can serve requests — check the "
-                              "free-tier grant on these accounts.")
+                    log.error("No Gemini key can serve requests — check billing "
+                              "and quota on these accounts.")
                     stop = True
                     break
         if stop:

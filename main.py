@@ -27,13 +27,19 @@ Environment variables (see README.md):
   GEMINI_SLEEP_BUDGET          default 240  (seconds of back-off per run)
   GEMINI_MAX_CONSECUTIVE_429   default 6    (429s that mean "no quota")
 
-On the Gemini free tier: treat it as small and unstable, not as a documented
-number. This key's ceiling fell from ~20 requests/day to ~6 over the fortnight
-to 2026-08-27, then to zero from 2026-08-28, while demand stayed flat. The
-429s it returned carried no "PerDay" marker, so the old code read them as
-"slow down" and slept 3x40s per article — about 40 minutes a run, which ate
-the workflow's timeout and reported red without naming a cause, for 16 days.
-Hence the back-off budget, the request-level counting and QuotaBlocked.
+On Gemini quota, learned the hard way in September 2026: this key bills against
+PREPAID CREDITS, not the free tier, and the balance ran out. Throughput fell
+from ~20 requests/day to ~6 over the fortnight to 2026-08-27 and to zero from
+2026-08-28, with demand flat throughout — a draining balance, not a shrinking
+quota. The 429s carry "Your prepayment credits are depleted" and no "PerDay"
+marker, so the old code read them as "slow down" and slept 3x40s per article:
+about 40 minutes a run, which ate the workflow's timeout and reported red
+without naming a cause, for 16 days.
+
+So: a 429 can mean "too fast", "today's allowance is spent", or "this account
+is out of money", and only the message body distinguishes them. Log it, and
+never sleep out the last two. Hence QuotaBlocked, the back-off budget and
+request-level counting below.
 """
 
 import hashlib
@@ -69,11 +75,13 @@ MAX_TOTAL = int(os.environ.get("MAX_TOTAL", "15"))
 # Hard cap on real Gemini HTTP requests per run (saves, gate-rejections and
 # in-call retries combined — GeminiStats counts requests, not articles).
 #
-# The old note here assumed ~1,500 free requests/day. That was never true of
-# this key: the run first hit its daily ceiling on 2026-08-13 after ~20 calls,
-# the ceiling then decayed to ~6/day by 2026-08-27 and to zero from 2026-08-28,
-# while demand stayed flat. Treat the free tier as small and unreliable; the
-# QuotaBlocked / DailyQuotaExhausted handlers stop the run cleanly either way.
+# The old note here assumed ~1,500 free requests/day. This key was never on the
+# free tier at all — it bills against prepaid credits, and that balance drained:
+# ~20 calls/day until 2026-08-13, ~6/day by 2026-08-27, nothing from 2026-08-28,
+# with demand flat throughout. So this cap cannot protect availability; only a
+# funded account can. Treat it as a spend rail. The QuotaBlocked and
+# DailyQuotaExhausted handlers end the run cleanly when money or allowance runs
+# out, whichever it turns out to be.
 MAX_GEMINI_CALLS = int(os.environ.get("MAX_GEMINI_CALLS", "40"))
 # Give up after this many articles in a row produce nothing usable. Without it
 # a key that 429s everything walked the entire candidate list, sleeping through
@@ -419,8 +427,8 @@ def write_showcase(db, saved):
 def main():
     # Keys are tried in order. Set GEMINI_API_KEY_FALLBACK (or list several
     # keys comma-separated in either variable) to keep the run producing when
-    # one account's free-tier grant is zeroed — as this one's was on
-    # 2026-08-28, costing 16 consecutive empty days.
+    # one account stops serving — as this one did on 2026-08-28 when its
+    # prepaid credits ran out, costing 16 consecutive empty days.
     keys = gemini_keys("GEMINI_API_KEY", "GEMINI_API_KEY_FALLBACK")
     if not keys:
         log.error("GEMINI_API_KEY is not set.")

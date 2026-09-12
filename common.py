@@ -240,11 +240,11 @@ class QuotaBlocked(Exception):
     quota right now.
 
     Distinct from DailyQuotaExhausted, which is Google explicitly naming the
-    per-day allowance as spent. A key whose free-tier grant has been reduced to
-    zero 429s from its very first request with no "PerDay" marker in the
-    message, so the old code read it as "slow down" and slept 40s at a time —
-    roughly 40 minutes across a run. That silently consumed the job's whole
-    timeout-minutes and reported red without ever naming the cause. Stop.
+    per-day allowance as spent. An account with no money left (a depleted
+    prepaid balance) 429s from its very first request with no "PerDay" marker
+    in the message, so the old code read it as "slow down" and slept 40s at a
+    time — roughly 40 minutes across a run. That silently consumed the job's
+    whole timeout-minutes and reported red without ever naming the cause.
     """
 
 
@@ -393,12 +393,24 @@ def generate_json(client, model, prompt, temperature=0.3, attempts=3, stats=None
                 raise ModelUnavailable(model) from exc
             if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
                 stats.consecutive_429 += 1
-                # Log the body. The quota id inside it is the difference
-                # between "slow down" and "this key has no allowance", and the
-                # old fixed log line discarded it — which is precisely why a
-                # fortnight of zero-quota runs looked like a mystery timeout.
+                # Log the body. What is inside it is the difference between
+                # "slow down", "today's allowance is spent" and "this account
+                # is out of money", and the old fixed log line discarded all
+                # three — which is precisely why 16 dead runs looked like a
+                # mystery timeout.
                 log.warning("Gemini 429 (attempt %d, %d consecutive): %s",
                             attempt, stats.consecutive_429, _short(msg))
+                # A depleted prepaid balance is billed, not windowed: it will
+                # not recover in 40s, at midnight Pacific, or ever, until
+                # someone tops the account up. Fail on the first one.
+                low = msg.lower()
+                if "credits are depleted" in low or "prepayment credit" in low:
+                    raise QuotaBlocked(
+                        "Gemini prepaid credits are depleted on this key — "
+                        "top the project up at https://ai.studio/projects, or "
+                        "configure a fallback key. Original error: %s"
+                        % _short(msg, 200)
+                    ) from exc
                 if "PerDay" in msg or "per day" in msg.lower():
                     raise DailyQuotaExhausted(model) from exc
                 if stats.consecutive_429 >= GEMINI_MAX_CONSECUTIVE_429:
