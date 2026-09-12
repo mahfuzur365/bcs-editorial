@@ -45,10 +45,20 @@ Environment variables:
 
 On quota: Gemini's free tier is metered PER GOOGLE CLOUD PROJECT, not per key.
 A second key minted inside the same project shares the same daily allowance and
-buys nothing — it must come from a different AI Studio project to give this
-pipeline independent headroom. That matters on Fridays, when both pipelines run
-an hour apart: the editorial run can spend up to MAX_GEMINI_CALLS before this
-one starts, and a shared, unexpectedly-small quota would starve it.
+buys nothing — it must come from a different project to give this pipeline
+independent headroom. In practice this pipeline's key comes from a different
+Google ACCOUNT, which is stronger still, and is why it kept working from
+2026-08-28 while the editorial key stopped entirely.
+
+That outage was billing, not quota: the editorial account runs on PREPAID
+CREDITS and the balance drained — ~20 requests/day until 2026-08-13, ~6/day by
+2026-08-27, zero from 2026-08-28, with demand flat throughout. Its 429s said
+"Your prepayment credits are depleted" and carried no "PerDay" marker, so they
+were mistaken for rate-limiting and slept off for ~40 minutes a run.
+
+So: count real requests (GeminiStats does, not logical calls), budget back-off
+(GEMINI_SLEEP_BUDGET), and stop on QuotaBlocked rather than sleeping through
+the job's timeout. A 429 is not automatically something to wait out.
 """
 
 import datetime as dt
@@ -63,8 +73,8 @@ from google import genai
 from common import (
     log, init_firebase, fetch_feed, gnews_search_url, resolve_gnews_link,
     extract_article, plain_text, looks_mojibake, entry_age_hours, today_bst,
-    period_fields, pick_model, generate_json,
-    ModelUnavailable, DailyQuotaExhausted,
+    period_fields, pick_model, generate_json, gemini_keys, GeminiStats,
+    ModelUnavailable, DailyQuotaExhausted, QuotaBlocked,
 )
 from update_sources import (
     EXAM_QUERIES, NEWS_FEEDS, BLOCK_PATTERNS, SEARCH_WINDOW,
@@ -73,8 +83,11 @@ from update_sources import (
 from firebase_admin import firestore
 
 # Prefer this pipeline's own key; fall back to the shared one so the run still
-# works before the second secret is added.
-API_KEY = os.environ.get("UPDATES_GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
+# works before the second secret is added. Either variable may hold several
+# comma-separated keys, and they are tried in order — a key on an account with
+# no credit left 429s every request, and rotating past it beats returning an
+# empty week.
+API_KEYS = gemini_keys("UPDATES_GEMINI_API_KEY", "GEMINI_API_KEY")
 OWN_KEY = bool(os.environ.get("UPDATES_GEMINI_API_KEY"))
 
 MAX_ITEMS = int(os.environ.get("UPDATES_MAX_ITEMS", "5"))
@@ -82,6 +95,11 @@ MAX_GEMINI_CALLS = int(os.environ.get("UPDATES_MAX_GEMINI_CALLS", "30"))
 MIN_SCORE = int(os.environ.get("UPDATES_MIN_SCORE", "6"))
 AUTO_PUBLISH = os.environ.get("UPDATES_AUTO_PUBLISH", "0") == "1"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "")
+
+# Give up after this many articles in a row produce nothing usable, rather
+# than walking the whole candidate list on a key that answers every request
+# with a 429.
+MAX_CONSECUTIVE_FAILURES = int(os.environ.get("MAX_CONSECUTIVE_FAILURES", "5"))
 
 MAX_PER_QUERY = 3          # candidates per search, per run
 MAX_AGE_HOURS = 3 * 24     # wire-feed cutoff; matches the 2-day search window
@@ -241,14 +259,14 @@ def collect_candidates():
     return candidates
 
 
-def build_note(client, model, item, text):
+def build_note(client, model, item, text, stats=None):
     """Ask Gemini to score and, if it passes, write the note."""
     prompt = (RELEVANCE_PROMPT
               .replace("{min_score}", str(MIN_SCORE))
               .replace("{source}", item["source"])
               .replace("{headline}", item["headline"])
               .replace("{text}", text[:16000]))
-    data = generate_json(client, model, prompt, temperature=0.2)
+    data = generate_json(client, model, prompt, temperature=0.2, stats=stats)
     if not isinstance(data, dict):
         return None
 
@@ -338,7 +356,7 @@ def purge_expired(db, col):
 
 
 def main():
-    if not API_KEY:
+    if not API_KEYS:
         log.error("No Gemini key. Set UPDATES_GEMINI_API_KEY (preferred) or GEMINI_API_KEY.")
         sys.exit(1)
     if OWN_KEY:
@@ -352,30 +370,58 @@ def main():
 
     db = init_firebase()
     col = db.collection("updates")
-    client = genai.Client(api_key=API_KEY)
 
     purge_expired(db, col)
 
-    model = pick_model(client, override=GEMINI_MODEL)
-    if not model:
-        log.error("No usable Gemini model found for this API key.")
-        sys.exit(1)
-    log.info("Using Gemini model: %s", model)
+    stats = GeminiStats()
+    key_index = -1
+    client = None
+    model = None
     dead_models = set()
+
+    def rotate_key():
+        """Advance to the next usable API key. False when none are left.
+
+        Also performs the initial selection, so a first key that is dead on
+        arrival falls through to the fallback instead of ending the run.
+        """
+        nonlocal key_index, client, model, dead_models
+        while key_index + 1 < len(API_KEYS):
+            key_index += 1
+            name, key = API_KEYS[key_index]
+            client = genai.Client(api_key=key)
+            dead_models = set()
+            stats.reset_backoff()
+            model = pick_model(client, override=GEMINI_MODEL)
+            if model:
+                if key_index == 0:
+                    log.info("Using Gemini key %s, model %s", name, model)
+                else:
+                    log.warning("Rotated to Gemini key %s, model %s", name, model)
+                return True
+            log.error("No usable Gemini model for key %s; trying the next.", name)
+        return False
+
+    if not rotate_key():
+        log.error("No usable Gemini model on any of the %d configured key(s).",
+                  len(API_KEYS))
+        sys.exit(1)
+    log.info("%d Gemini key(s) available", len(API_KEYS))
 
     candidates = collect_candidates()
     log.info("Collected %d candidate article(s)", len(candidates))
 
     saved = rejected = skipped = failed = 0
-    calls = 0
+    consecutive_failures = 0
     stop = False
 
     for item in candidates:
         if saved >= MAX_ITEMS:
             log.info("Reached UPDATES_MAX_ITEMS=%d; stopping.", MAX_ITEMS)
             break
-        if calls >= MAX_GEMINI_CALLS:
-            log.info("Reached UPDATES_MAX_GEMINI_CALLS=%d; stopping.", MAX_GEMINI_CALLS)
+        if stats.requests >= MAX_GEMINI_CALLS:
+            log.info("Reached UPDATES_MAX_GEMINI_CALLS=%d requests; stopping.",
+                     MAX_GEMINI_CALLS)
             break
 
         doc_id = hashlib.sha1(item["url"].encode("utf-8")).hexdigest()[:20]
@@ -397,28 +443,51 @@ def main():
         note = None
         while True:
             try:
-                calls += 1
-                note = build_note(client, model, item, text)
+                note = build_note(client, model, item, text, stats)
                 break
             except ModelUnavailable:
                 dead_models.add(model)
                 model = pick_model(client, exclude=dead_models, override=GEMINI_MODEL)
                 if not model:
-                    log.error("Ran out of usable Gemini models; stopping run.")
-                    stop = True
-                    break
+                    log.error("Ran out of usable Gemini models on key %s.",
+                              API_KEYS[key_index][0])
+                    if not rotate_key():
+                        stop = True
+                        break
+                    continue
                 log.info("Switched to Gemini model: %s", model)
             except DailyQuotaExhausted:
-                log.warning("Gemini daily quota exhausted; stopping. Saved items are kept.")
-                stop = True
-                break
+                log.warning("Gemini daily quota exhausted on key %s.",
+                            API_KEYS[key_index][0])
+                if not rotate_key():
+                    log.warning("No key has quota left; stopping. "
+                                "Saved items are kept.")
+                    stop = True
+                    break
+            except QuotaBlocked as exc:
+                # Persistent 429s with no per-day marker: this key's allowance
+                # is effectively zero, not merely spent. Never sleep it out.
+                log.error("Gemini key %s is blocked: %s",
+                          API_KEYS[key_index][0], exc)
+                if not rotate_key():
+                    log.error("No Gemini key can serve requests — check billing "
+                              "and quota on these accounts.")
+                    stop = True
+                    break
         if stop:
             break
         time.sleep(GEMINI_COOLDOWN_SECONDS)
 
         if not note:
             failed += 1
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                log.error("%d articles in a row produced nothing usable; "
+                          "stopping rather than walking the whole list.",
+                          consecutive_failures)
+                break
             continue
+        consecutive_failures = 0
         if note.get("rejected"):
             rejected += 1
             log.info("Not exam-relevant (score %d, %s): %s",
@@ -448,10 +517,17 @@ def main():
         touch_archive_index(db, period_fields(today_bst()))
         log.info("Saved (score %d) [%s] %s", note["score"], note["category"], note["title"][:70])
 
-    log.info("Done. saved=%d rejected=%d skipped=%d failed=%d gemini_calls=%d status=%s",
-             saved, rejected, skipped, failed, calls,
+    log.info("Done. saved=%d rejected=%d skipped=%d failed=%d "
+             "gemini_requests=%d backoff=%.0fs key=%s status=%s",
+             saved, rejected, skipped, failed, stats.requests,
+             stats.sleep_spent, API_KEYS[key_index][0],
              "published" if AUTO_PUBLISH else "draft")
     if saved == 0 and (failed > 0 or stop):
+        if stop:
+            log.error("FAILED: no updates saved — Gemini quota. Last error: %s",
+                      (stats.last_error or "n/a")[:300])
+        else:
+            log.error("FAILED: no updates saved — %d article(s) failed.", failed)
         sys.exit(1)  # nothing saved despite trying → surface red in Actions
 
 

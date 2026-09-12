@@ -235,6 +235,90 @@ class DailyQuotaExhausted(Exception):
     """Free-tier requests-per-day quota is gone; it won't reset mid-run."""
 
 
+class QuotaBlocked(Exception):
+    """Gemini 429'd persistently enough that this key plainly has no usable
+    quota right now.
+
+    Distinct from DailyQuotaExhausted, which is Google explicitly naming the
+    per-day allowance as spent. An account with no money left (a depleted
+    prepaid balance) 429s from its very first request with no "PerDay" marker
+    in the message, so the old code read it as "slow down" and slept 40s at a
+    time — roughly 40 minutes across a run. That silently consumed the job's
+    whole timeout-minutes and reported red without ever naming the cause.
+    """
+
+
+# Total seconds one run may spend sleeping on Gemini back-off. Deliberately far
+# below the workflows' timeout-minutes so a dead key fails fast and legibly
+# instead of grinding out the entire job.
+GEMINI_SLEEP_BUDGET_SECONDS = int(os.environ.get("GEMINI_SLEEP_BUDGET", "240"))
+
+# Consecutive 429s that mean "this key has no allowance", not "too fast".
+GEMINI_MAX_CONSECUTIVE_429 = int(os.environ.get("GEMINI_MAX_CONSECUTIVE_429", "6"))
+
+GEMINI_RATE_LIMIT_SLEEP = 40
+
+
+def _short(msg, limit=300):
+    """One-line, truncated error text. Gemini errors are multi-line JSON, and
+    the quota id buried in them is the only thing that separates "too fast"
+    from "no allowance at all" — so it must reach the log, but not flood it."""
+    return " ".join(str(msg).split())[:limit]
+
+
+class GeminiStats:
+    """Per-run Gemini accounting, shared across every generate_json call.
+
+    `requests` counts real HTTP requests, not logical summarise calls. The old
+    per-article counter incremented once per summarize() while generate_json
+    retried up to 3 times inside, under-reporting by up to 3x — so a cap of 40
+    quietly permitted ~120 requests against the free tier.
+    """
+
+    def __init__(self):
+        self.requests = 0
+        self.sleep_spent = 0.0
+        self.consecutive_429 = 0
+        self.last_error = ""
+
+    def reset_backoff(self):
+        """Fresh back-off budget — called after rotating to another API key."""
+        self.sleep_spent = 0.0
+        self.consecutive_429 = 0
+
+    def nap(self, seconds, why):
+        """Sleep against the run's shared back-off budget, or give up."""
+        remaining = GEMINI_SLEEP_BUDGET_SECONDS - self.sleep_spent
+        if remaining <= 0:
+            raise QuotaBlocked(
+                "back-off budget of %ds is spent; last error: %s"
+                % (GEMINI_SLEEP_BUDGET_SECONDS, _short(self.last_error, 200))
+            )
+        secs = min(seconds, remaining)
+        log.warning("Gemini %s; waiting %.0fs (back-off %.0fs/%ds used)",
+                    why, secs, self.sleep_spent + secs,
+                    GEMINI_SLEEP_BUDGET_SECONDS)
+        time.sleep(secs)
+        self.sleep_spent += secs
+
+
+def gemini_keys(*env_names):
+    """API keys to try, in order, de-duplicated, as (env_name, key) pairs.
+
+    Each variable may hold several comma-separated keys, so a spare can be
+    added as a secret without a code change. Returning the variable's name
+    alongside lets logs say which key is in play without printing the key.
+    """
+    keys, seen = [], set()
+    for name in env_names:
+        for raw in os.environ.get(name, "").split(","):
+            key = raw.strip()
+            if key and key not in seen:
+                seen.add(key)
+                keys.append((name, key))
+    return keys
+
+
 def list_usable_models(client):
     """Model names this API key can call generateContent on."""
     names = []
@@ -278,32 +362,64 @@ def pick_model(client, exclude=(), override=""):
     return preferred[0] if preferred else None
 
 
-def generate_json(client, model, prompt, temperature=0.3, attempts=3):
+def generate_json(client, model, prompt, temperature=0.3, attempts=3, stats=None):
     """Call Gemini and parse a JSON response, retrying transient failures.
 
-    Raises ModelUnavailable / DailyQuotaExhausted so the caller can switch
-    models or stop the run — retrying those here only burns quota."""
+    Raises ModelUnavailable / DailyQuotaExhausted / QuotaBlocked so the caller
+    can switch models, rotate keys or stop the run — retrying those here only
+    burns quota and wall-clock.
+
+    `stats` carries the run-wide request count and back-off budget; pass the
+    same instance on every call so the budget is actually shared.
+    """
+    stats = stats if stats is not None else GeminiStats()
     for attempt in range(1, attempts + 1):
         try:
+            stats.requests += 1
             resp = client.models.generate_content(
                 model=model,
                 contents=prompt,
                 config={"response_mime_type": "application/json",
                         "temperature": temperature},
             )
+            stats.consecutive_429 = 0  # the key is serving again
             raw = (resp.text or "").strip()
             raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.M).strip()
             return json.loads(raw)
         except Exception as exc:
             msg = str(exc)
+            stats.last_error = msg
             if "NOT_FOUND" in msg or "404" in msg:
                 raise ModelUnavailable(model) from exc
             if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                stats.consecutive_429 += 1
+                # Log the body. What is inside it is the difference between
+                # "slow down", "today's allowance is spent" and "this account
+                # is out of money", and the old fixed log line discarded all
+                # three — which is precisely why 16 dead runs looked like a
+                # mystery timeout.
+                log.warning("Gemini 429 (attempt %d, %d consecutive): %s",
+                            attempt, stats.consecutive_429, _short(msg))
+                # A depleted prepaid balance is billed, not windowed: it will
+                # not recover in 40s, at midnight Pacific, or ever, until
+                # someone tops the account up. Fail on the first one.
+                low = msg.lower()
+                if "credits are depleted" in low or "prepayment credit" in low:
+                    raise QuotaBlocked(
+                        "Gemini prepaid credits are depleted on this key — "
+                        "top the project up at https://ai.studio/projects, or "
+                        "configure a fallback key. Original error: %s"
+                        % _short(msg, 200)
+                    ) from exc
                 if "PerDay" in msg or "per day" in msg.lower():
                     raise DailyQuotaExhausted(model) from exc
-                log.warning("Gemini rate-limited (attempt %d); waiting 40s", attempt)
-                time.sleep(40)
+                if stats.consecutive_429 >= GEMINI_MAX_CONSECUTIVE_429:
+                    raise QuotaBlocked(
+                        "%d consecutive 429s on %s; last error: %s"
+                        % (stats.consecutive_429, model, _short(msg, 200))
+                    ) from exc
+                stats.nap(GEMINI_RATE_LIMIT_SLEEP, "rate-limited")
                 continue
-            log.warning("Gemini attempt %d failed (%s); retrying in 8s", attempt, exc)
-            time.sleep(8)
+            log.warning("Gemini attempt %d failed: %s", attempt, _short(msg))
+            stats.nap(8, "transient error")
     return None

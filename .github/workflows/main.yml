@@ -23,7 +23,12 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Was 45. A healthy run takes 4-15 minutes; the only thing that ever used
+    # the other 30 was Gemini back-off on a key with no quota, which now has
+    # its own budget (GEMINI_SLEEP_BUDGET) and stops the run instead. Keeping
+    # this tight means a genuine hang shows up as a timeout the same morning
+    # rather than hiding inside a plausible-looking 45-minute job.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -42,5 +47,35 @@ jobs:
       - name: Run pipeline
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional spare key, tried when the one above is out of credit or
+          # allowance. Rotation retries the same article, so nothing is lost.
+          GEMINI_API_KEY_FALLBACK: ${{ secrets.GEMINI_API_KEY_FALLBACK }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+          # ---- free-tier budget -------------------------------------------
+          # GEMINI_MODEL is deliberately NOT set. Pinning looks like the right
+          # thing — "gemini-flash-latest" is hot-swapped with every Flash
+          # release, and Google's docs say latest aliases "will typically have
+          # billing enabled" — but gemini-2.5-flash was tried here on
+          # 2026-09-12 and is unavailable to both of these keys (it was retired
+          # for new keys, as pick_model's own comment records). The pin merely
+          # wasted one request per key before pick_model fell through to the
+          # alias. Pin again only after checking what the key can actually
+          # call, and mainly when cost matters, i.e. on a funded key.
+
+          # Measured 2026-09-12: a free-tier key on this account serves
+          # ~10-16 requests/day before Google returns a per-day 429, while
+          # MAX_TOTAL=15 needed ~20 and could never finish.
+          #
+          # MAX_GEMINI_CALLS is NOT sized from articles. The first free-tier
+          # run spent 13 requests to save 2, because Google returned eight 503s
+          # and each costs three attempts. GeminiStats counts real requests, so
+          # server flakiness draws on this budget. Keep it well above the
+          # per-day ceiling and let Google's 429 be what stops the run — that
+          # path is handled cleanly now — rather than capping ourselves early.
+          #
+          # Deliberate free-tier settings, not limits of the pipeline. On a
+          # funded key: MAX_TOTAL 15, MAX_GEMINI_CALLS 40.
+          MAX_TOTAL: "6"
+          MAX_GEMINI_CALLS: "25"
         run: python main.py

@@ -1,6 +1,13 @@
-feedparser>=6.0.11
-requests>=2.32.0
-trafilatura>=1.12.0
-google-genai>=1.16.0
-firebase-admin>=6.5.0
-googlenewsdecoder>=0.1.7
+# Pinned exactly. These were floating on ">=" until 2026-09-12, which meant
+# every scheduled run installed whatever was newest and the pipeline's runtime
+# could change with no commit behind it — google-genai drifted 2.20.0 -> 2.23.0
+# across the very window being debugged, adding a variable to an unrelated
+# investigation. Versions below are those a green run actually used.
+#
+# Bump deliberately, in a commit, so a regression has something to bisect.
+feedparser==6.0.14
+requests==2.34.2
+trafilatura==2.2.0
+google-genai==2.23.0
+firebase-admin==7.5.0
+googlenewsdecoder==0.1.7
