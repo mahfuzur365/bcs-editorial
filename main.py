@@ -558,8 +558,9 @@ def main():
                 if not rotate_key():
                     log.error(
                         "No Gemini key can serve requests. This is an account "
-                        "quota problem, not a code fault — check the free-tier "
-                        "grant for the key in GEMINI_API_KEY, or set "
+                        "billing/quota problem, not a code fault — check credit "
+                        "and quota for the key in GEMINI_API_KEY at "
+                        "https://ai.studio/projects, or set "
                         "GEMINI_API_KEY_FALLBACK to a key from another account."
                     )
                     quota_gone = True
