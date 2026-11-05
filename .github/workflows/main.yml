@@ -79,3 +79,23 @@ jobs:
           MAX_TOTAL: "6"
           MAX_GEMINI_CALLS: "25"
         run: python main.py
+
+  # GitHub disables scheduled workflows in a public repo after 60 days without
+  # a commit — and these runs never commit. Re-enabling both workflows through
+  # the API after every run resets that timer, so they never lapse. Runs even
+  # if the pipeline failed; needs only `actions: write`, no commits.
+  keepalive:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Re-enable scheduled workflows
+        run: |
+          for wf in main.yml updates.yml; do
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/$wf/enable" && echo "kept alive: $wf"
+          done
